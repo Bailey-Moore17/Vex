@@ -1,0 +1,1009 @@
+Here’s the build I’d ship.
+
+The first systems correction is this: you do not actually get “never stops.” You get restart-safe continuity. The process can die, reboot, or be upgraded; the mind survives because identity, goals, memory, schedules, and pending actions are durable, and startup deterministically rehydrates them.
+
+1) Recommended stack
+
+I recommend Python 3.12+ for the daemon, but on your Windows 11 machine I would run it inside WSL2 Ubuntu, alongside the OpenClaw gateway in the same distro. That is the cleanest fit because OpenClaw itself recommends WSL2 on Windows, notes that native Windows is improving but still trickier, and documents a headless startup chain using systemd in WSL plus a Windows Scheduled Task to boot WSL before sign-in. WSL itself now supports systemd through /etc/wsl.conf.
+
+Why Python: the official Anthropic Python SDK exists and supports streaming, retries, and error handling; Python’s standard library already includes sqlite3; asyncio has TaskGroup; and the file-watching ecosystem is mature (watchdog). That gives you one language for the daemon core, the DB layer, the scheduler, and the bridge.
+
+For the service shape, I would use:
+
+FastAPI only for ingress, health, metrics, and control endpoints.
+
+asyncio for the actual long-lived runtime.
+
+A custom DB-backed scheduler/event bus as the source of truth.
+
+SQLite as the primary state store.
+
+FTS5 for lexical retrieval.
+
+Stored embeddings + app-side cosine search for MVP, with optional later acceleration via sqlite-vec. SQLite FTS5 is built-in; WAL and busy timeouts are standard concurrency tools; sqlite-vec is cross-platform but still pre-v1, so I would not make it a boot dependency on day one.
+
+Native Windows fallback: wrap the same Python entrypoint with WinSW if you refuse WSL2. WinSW is an active Windows Service Wrapper project; NSSM also works, but WinSW is the cleaner maintained choice today. I would still prefer WSL2 because it matches OpenClaw’s own runtime model.
+
+2) The architecture I’d use
+
+Treat OpenClaw as transport + tools, not as your sovereign state store.
+
+Your daemon should own:
+
+identity
+
+memory
+
+goals/projects
+
+relationship models
+
+emotional state
+
+scheduler/event bus
+
+model routing
+
+action planning
+
+pending actions / recovery
+
+OpenClaw should own:
+
+inbound/outbound chat surfaces
+
+browser, nodes, gateway tools
+
+existing channel connections
+
+optional channel-side cron or wake hooks
+
+OpenClaw already exposes a typed WebSocket API with request/response/event frames, and it has external hook endpoints like /hooks/wake and /hooks/agent. Its internal hooks can also fire on message:received, message:preprocessed, and message:sent. Core tool surfaces include message, browser, nodes, cron, and gateway. That is enough to make OpenClaw your body while the daemon becomes the mind.
+
+The clean mental model is:
+
+OpenClaw inbound event -> daemon ingest -> durable state update -> context retrieval -> model call -> action plan -> OpenClaw tool/message execution -> durable writeback -> optional future scheduling
+
+That gives you a body-independent mind because the reasoning and continuity live outside the gateway process.
+
+3) What the process tree should look like
+
+On the Windows box:
+
+Windows Scheduled Task: boots WSL on machine startup
+
+WSL systemd: supervises openclaw-gateway.service
+
+WSL systemd: supervises vexd.service
+
+OpenClaw’s Windows guidance already documents enable-linger, openclaw gateway install, and the Scheduled Task pattern to boot WSL before login. I would mirror that for the daemon.
+
+Systemd unit:
+
+# /etc/systemd/user/vexd.service
+[Unit]
+Description=Vex Persistent Mind Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vexd
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/vexd/.venv/bin/python -m vexd.daemon
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillSignal=SIGINT
+
+[Install]
+WantedBy=default.target
+
+And on Windows once:
+
+schtasks /create /tn "WSL Boot" /tr "wsl.exe -d Ubuntu --exec /bin/true" /sc onstart /ru SYSTEM
+
+That is the right answer to “never stops”: supervised service + durable state + restart-safe queues.
+
+4) Project structure
+vexd/
+  pyproject.toml
+  .env.example
+  README.md
+
+  ops/
+    systemd/
+      vexd.service
+    windows/
+      wsl-boot-task.ps1
+    openclaw/
+      bridge-hook/
+        HOOK.md
+        handler.ts
+
+  src/vexd/
+    daemon.py                 # main entrypoint
+    config.py
+    logging.py
+
+    api/
+      app.py                  # FastAPI app
+      schemas.py
+      routes_health.py
+      routes_ingress.py
+      routes_control.py
+
+    runtime/
+      supervisor.py           # startup, shutdown, recovery
+      event_bus.py            # in-proc queues + durable emission
+      locks.py                # per-thread / per-person locks
+      reconciliation.py       # crash recovery and queue replay
+
+    db/
+      connection.py
+      pragmas.py
+      migrations/
+        0001_core.sql
+      repo/
+        identity_repo.py
+        people_repo.py
+        relationship_repo.py
+        projects_repo.py
+        goals_repo.py
+        messages_repo.py
+        episodic_repo.py
+        semantic_repo.py
+        scheduler_repo.py
+        actions_repo.py
+        retrieval_repo.py
+
+    memory/
+      chunker.py
+      projector.py            # transactional tables -> retrieval projection
+      embeddings.py
+      retrieval.py
+      consolidator.py         # episodic -> semantic distillation
+
+    cognition/
+      context_builder.py
+      identity_capsule.py
+      emotion_engine.py
+      self_model_engine.py
+      planner.py
+      reply_builder.py
+
+    router/
+      policy.py
+      model_clients/
+        anthropic_client.py
+        openai_client.py
+      task_types.py
+
+    bridge/
+      openclaw_client.py      # WS + HTTP wrapper
+      inbound_normalizer.py
+      outbound_dispatcher.py
+      tool_executor.py
+
+    watchers/
+      filesystem.py
+      openclaw_events.py
+      pollers.py
+
+  tests/
+    test_scheduler.py
+    test_context_builder.py
+    test_router.py
+    test_recovery.py
+    test_openclaw_bridge.py
+
+FastAPI’s role here is narrow: ingress and lifecycle. Long-lived workers should start from the app lifespan, not from ad-hoc background task helpers. asyncio.TaskGroup is the right orchestration primitive for the persistent loops.
+
+5) SQLite schema
+
+Use one authoritative relational schema plus one read-optimized retrieval projection. Do not search the transactional tables directly during a model call. Project them into a unified memory index.
+
+Also: store timestamps as UTC ISO-8601 TEXT. SQLite does not have a dedicated datetime type; TEXT/REAL/INTEGER are the supported patterns. Turn on WAL and a busy timeout.
+
+PRAGMA journal_mode = WAL;
+PRAGMA foreign_keys = ON;
+PRAGMA busy_timeout = 5000;
+
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS identity_core (
+    mind_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    invariant_self TEXT NOT NULL,
+    mission TEXT NOT NULL,
+    core_values_json TEXT NOT NULL DEFAULT '[]',
+    boundaries_json TEXT NOT NULL DEFAULT '[]',
+    voice_spec TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS identity_capsules (
+    capsule_id TEXT PRIMARY KEY,
+    mind_id TEXT NOT NULL REFERENCES identity_core(mind_id) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    capsule_text TEXT NOT NULL,
+    trigger_event_id TEXT,
+    token_estimate INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 0 CHECK (active IN (0,1)),
+    created_at TEXT NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_capsules_active
+ON identity_capsules(mind_id)
+WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS self_model (
+    mind_id TEXT PRIMARY KEY REFERENCES identity_core(mind_id) ON DELETE CASCADE,
+    capabilities_json TEXT NOT NULL DEFAULT '[]',
+    limitations_json TEXT NOT NULL DEFAULT '[]',
+    patterns_json TEXT NOT NULL DEFAULT '[]',
+    growth_areas_json TEXT NOT NULL DEFAULT '[]',
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS affect_state (
+    mind_id TEXT PRIMARY KEY REFERENCES identity_core(mind_id) ON DELETE CASCADE,
+    valence REAL NOT NULL DEFAULT 0.0,
+    intensity REAL NOT NULL DEFAULT 0.0 CHECK (intensity >= 0.0 AND intensity <= 1.0),
+    primary_emotion TEXT,
+    trigger_summary TEXT,
+    decay_half_life_minutes INTEGER NOT NULL DEFAULT 240,
+    last_decay_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS people (
+    person_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_handles (
+    handle_id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL REFERENCES people(person_id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    username TEXT,
+    is_primary INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0,1)),
+    UNIQUE(platform, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS relationships (
+    person_id TEXT PRIMARY KEY REFERENCES people(person_id) ON DELETE CASCADE,
+    trust_level REAL NOT NULL DEFAULT 0.5 CHECK (trust_level >= 0.0 AND trust_level <= 1.0),
+    familiarity REAL NOT NULL DEFAULT 0.0 CHECK (familiarity >= 0.0 AND familiarity <= 1.0),
+    sentiment REAL NOT NULL DEFAULT 0.0 CHECK (sentiment >= -1.0 AND sentiment <= 1.0),
+    relationship_summary TEXT NOT NULL DEFAULT '',
+    preferences_json TEXT NOT NULL DEFAULT '{}',
+    boundaries_json TEXT NOT NULL DEFAULT '{}',
+    last_interaction_at TEXT,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projects (
+    project_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('active','paused','done','dropped')),
+    priority INTEGER NOT NULL DEFAULT 50,
+    deadline_at TEXT,
+    parent_project_id TEXT REFERENCES projects(project_id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS goals (
+    goal_id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES projects(project_id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL CHECK (status IN ('active','blocked','paused','done','dropped')),
+    priority INTEGER NOT NULL DEFAULT 50,
+    urgency INTEGER NOT NULL DEFAULT 50,
+    deadline_at TEXT,
+    success_criteria TEXT NOT NULL DEFAULT '',
+    progress REAL NOT NULL DEFAULT 0.0 CHECK (progress >= 0.0 AND progress <= 1.0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    decision_id TEXT PRIMARY KEY,
+    project_id TEXT REFERENCES projects(project_id) ON DELETE SET NULL,
+    related_goal_id TEXT REFERENCES goals(goal_id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    context TEXT NOT NULL DEFAULT '',
+    decision_text TEXT NOT NULL,
+    reasoning_summary TEXT NOT NULL DEFAULT '',
+    confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    reversible INTEGER NOT NULL DEFAULT 1 CHECK (reversible IN (0,1)),
+    status TEXT NOT NULL CHECK (status IN ('active','superseded','reverted')),
+    made_at TEXT NOT NULL,
+    superseded_by TEXT REFERENCES decisions(decision_id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS conversation_threads (
+    thread_id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    external_conversation_id TEXT NOT NULL,
+    openclaw_session_key TEXT,
+    person_id TEXT REFERENCES people(person_id) ON DELETE SET NULL,
+    title TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(platform, external_conversation_id)
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    thread_id TEXT NOT NULL REFERENCES conversation_threads(thread_id) ON DELETE CASCADE,
+    person_id TEXT REFERENCES people(person_id) ON DELETE SET NULL,
+    role TEXT NOT NULL CHECK (role IN ('user','assistant','system','tool','daemon')),
+    content TEXT NOT NULL,
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    occurred_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS episodic_events (
+    event_id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    thread_id TEXT REFERENCES conversation_threads(thread_id) ON DELETE SET NULL,
+    person_id TEXT REFERENCES people(person_id) ON DELETE SET NULL,
+    related_decision_id TEXT REFERENCES decisions(decision_id) ON DELETE SET NULL,
+    summary TEXT NOT NULL,
+    details TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    importance REAL NOT NULL DEFAULT 0.5 CHECK (importance >= 0.0 AND importance <= 1.0),
+    happened_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS semantic_memory (
+    memory_id TEXT PRIMARY KEY,
+    topic_key TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('belief','opinion','pattern','fact','rule')),
+    statement TEXT NOT NULL,
+    stance TEXT,
+    confidence REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+    evidence_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL CHECK (status IN ('active','superseded','retracted')),
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    superseded_by TEXT REFERENCES semantic_memory(memory_id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS pending_actions (
+    action_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_event_id TEXT REFERENCES episodic_events(event_id) ON DELETE SET NULL,
+    thread_id TEXT REFERENCES conversation_threads(thread_id) ON DELETE SET NULL,
+    priority INTEGER NOT NULL DEFAULT 50,
+    status TEXT NOT NULL CHECK (status IN ('queued','running','done','failed','cancelled')),
+    execute_after TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    idempotency_key TEXT NOT NULL UNIQUE,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS scheduled_events (
+    scheduled_id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL CHECK (kind IN ('once','interval','cron','watch')),
+    title TEXT NOT NULL,
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('internal','openclaw','tool','reminder')),
+    cron_expr TEXT,
+    interval_seconds INTEGER,
+    watch_spec_json TEXT,
+    run_at TEXT,
+    timezone TEXT NOT NULL DEFAULT 'UTC',
+    next_fire_at TEXT NOT NULL,
+    last_fire_at TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+-- Unified retrieval projection
+CREATE TABLE IF NOT EXISTS memory_items (
+    item_id TEXT PRIMARY KEY,
+    source_table TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    memory_class TEXT NOT NULL CHECK (
+        memory_class IN (
+            'identity','self_model','emotion','relationship','project',
+            'goal','decision','message','episode','semantic','action'
+        )
+    ),
+    title TEXT NOT NULL DEFAULT '',
+    canonical_text TEXT NOT NULL,
+    person_id TEXT REFERENCES people(person_id) ON DELETE SET NULL,
+    project_id TEXT REFERENCES projects(project_id) ON DELETE SET NULL,
+    importance REAL NOT NULL DEFAULT 0.5 CHECK (importance >= 0.0 AND importance <= 1.0),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(source_table, source_id)
+);
+
+CREATE TABLE IF NOT EXISTS memory_chunks (
+    chunk_id INTEGER PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES memory_items(item_id) ON DELETE CASCADE,
+    chunk_index INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    chunk_text TEXT NOT NULL,
+    token_estimate INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    UNIQUE(item_id, chunk_index)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_chunks_fts USING fts5(
+    title,
+    chunk_text,
+    content='memory_chunks',
+    content_rowid='chunk_id'
+);
+
+CREATE TRIGGER IF NOT EXISTS memory_chunks_ai AFTER INSERT ON memory_chunks BEGIN
+    INSERT INTO memory_chunks_fts(rowid, title, chunk_text)
+    VALUES (new.chunk_id, new.title, new.chunk_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_chunks_ad AFTER DELETE ON memory_chunks BEGIN
+    INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, title, chunk_text)
+    VALUES ('delete', old.chunk_id, old.title, old.chunk_text);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memory_chunks_au AFTER UPDATE ON memory_chunks BEGIN
+    INSERT INTO memory_chunks_fts(memory_chunks_fts, rowid, title, chunk_text)
+    VALUES ('delete', old.chunk_id, old.title, old.chunk_text);
+    INSERT INTO memory_chunks_fts(rowid, title, chunk_text)
+    VALUES (new.chunk_id, new.title, new.chunk_text);
+END;
+
+CREATE TABLE IF NOT EXISTS memory_embeddings (
+    chunk_id INTEGER PRIMARY KEY REFERENCES memory_chunks(chunk_id) ON DELETE CASCADE,
+    model_name TEXT NOT NULL,
+    dims INTEGER NOT NULL,
+    embedding BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_thread_time
+ON messages(thread_id, occurred_at);
+
+CREATE INDEX IF NOT EXISTS idx_episodic_events_time
+ON episodic_events(happened_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_topic
+ON semantic_memory(topic_key, status, last_seen_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_goals_status_priority
+ON goals(status, priority DESC, deadline_at);
+
+CREATE INDEX IF NOT EXISTS idx_pending_actions_due
+ON pending_actions(status, execute_after, priority DESC);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_events_due
+ON scheduled_events(enabled, next_fire_at);
+
+CREATE INDEX IF NOT EXISTS idx_memory_items_class_updated
+ON memory_items(memory_class, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_memory_chunks_item
+ON memory_chunks(item_id, chunk_index);
+
+CREATE INDEX IF NOT EXISTS idx_relationships_updated
+ON relationships(updated_at DESC);
+
+That schema deliberately separates authoritative state from the memory projection. The daemon writes structured truth into relational tables, then projects searchable chunks into memory_items / memory_chunks / memory_embeddings. That keeps retrieval fast without turning the whole mind into an undifferentiated vector store. SQLite supports the relational side, FTS5 provides full-text search, and sqlite-vec can be added later only if you need native vector acceleration.
+
+6) Identity capsule design
+
+Make the capsule a derived artifact, not the canonical self.
+
+Canonical self:
+
+identity_core
+
+self_model
+
+affect_state
+
+active goals / projects
+
+current relationships
+
+Capsule:
+
+400–900 token summary
+
+regenerated only after meaningful change
+
+versioned in identity_capsules
+
+exactly one active capsule
+
+I would inject this into every reasoning call:
+
+IDENTITY CAPSULE
+- Name / role
+- Stable mission
+- Non-negotiable values and boundaries
+- Current emotional tone
+- Current active projects and goals
+- Current commitments and promises
+- Important people in play right now
+- Known limitations / blind spots
+- Next queued actions
+
+Rule: only rebuild the capsule when one of these changes materially:
+
+a decision is made
+
+a goal/project changes status
+
+relationship trust or sentiment changes
+
+emotional state crosses a threshold
+
+self-model changes
+
+a high-importance event lands
+
+7) Retrieval layer
+
+At inference time, do not load “all memory.” Build context in layers:
+
+Always load:
+
+identity_core
+
+active identity capsule
+
+self_model
+
+decayed affect_state
+
+active goals/projects
+
+due pending_actions
+
+Load current interlocutor state:
+
+person match from person_handles
+
+relationships row
+
+recent messages for this thread
+
+Retrieve relevant memory:
+
+FTS5 search over memory_chunks_fts
+
+semantic search over memory_embeddings
+
+fuse results with weighted rank + recency + importance boost
+
+dedupe by item_id
+
+Assemble under a token budget:
+
+hard cap per section
+
+never more than N chunks per source class
+
+include citations back to source_table/source_id
+
+For embeddings, I would start with OpenAI text-embedding-3-small because it is cheap and purpose-built for retrieval, with default 1536-dimensional vectors. If you know multimodal memory is coming soon, Gemini embeddings are now a serious option and Gemini’s embedding docs explicitly cover multimodal inputs. Voyage is also attractive later because it distinguishes query and document embeddings cleanly.
+
+For MVP, store embeddings in memory_embeddings and compute cosine in Python against a prefiltered candidate set. That keeps the dependency footprint boring. Add native vector acceleration later when memory volume justifies it. sqlite-vec exists and runs on Windows/Linux/Mac, but its own docs mark it pre-v1.
+
+8) Event loop design
+
+Use one process, one event bus, multiple cooperative loops.
+
+# src/vexd/daemon.py
+import asyncio
+from contextlib import AsyncExitStack
+from vexd.api.app import build_app
+from vexd.runtime.supervisor import (
+    recover_state,
+    start_http_server,
+    scheduler_loop,
+    ingestion_loop,
+    cognition_loop,
+    action_loop,
+    projection_loop,
+    health_loop,
+)
+
+async def main() -> None:
+    cfg = load_config()
+    db = open_db(cfg.db_path)
+    apply_pragmas(db)
+    migrate(db)
+
+    # Crash recovery:
+    # - queued failed/running actions -> queued
+    # - due scheduled events -> emit
+    # - rebuild in-memory locks, caches, projections
+    await recover_state(db)
+
+    app = build_app(cfg, db)
+
+    async with AsyncExitStack():
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(start_http_server(app, cfg.http))
+            tg.create_task(scheduler_loop(cfg, db))
+            tg.create_task(ingestion_loop(cfg, db))
+            tg.create_task(cognition_loop(cfg, db))
+            tg.create_task(action_loop(cfg, db))
+            tg.create_task(projection_loop(cfg, db))
+            tg.create_task(health_loop(cfg, db))
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+And the real cognition loop should be serialized per conversation/person so continuity stays coherent:
+
+async def cognition_loop(cfg, db):
+    while True:
+        event = await event_bus.get()
+
+        lock_key = event.thread_id or event.person_id or "global"
+        async with lock_manager.lock(lock_key):
+            ingest_event(db, event)
+            decay_affect_state(db)
+
+            ctx = build_context(db, event)
+            task = classify_task(ctx)
+
+            model = model_router.pick(task)
+            result = await model.generate(ctx.system, ctx.messages, ctx.tools)
+
+            persist_reasoning_outcome(db, event, result)
+            update_identity_capsule_if_needed(db, event, result)
+            enqueue_followups(db, event, result)
+
+asyncio.TaskGroup is the right primitive for the long-lived workers, and FastAPI’s lifespan mechanism is the correct place to wire service startup/shutdown.
+
+9) Scheduler / event bus
+
+Do not let OpenClaw cron be the daemon’s source of truth. OpenClaw’s cron is useful, but its docs are clear that cron runs inside the Gateway, not inside the model/mind runtime. Use your own scheduler for the mind. Mirror into OpenClaw only when you specifically need a gateway-side timed action.
+
+My scheduler design:
+
+scheduled_events is canonical state.
+
+A scheduler loop polls next_fire_at.
+
+watchdog emits file-change events.
+
+Pollers emit “API changed” events.
+
+Every event, regardless of origin, becomes a normalized MindEvent.
+
+pending_actions is the durable outbox/inbox for follow-up work.
+
+Event types:
+
+message_inbound
+
+message_delivered
+
+file_changed
+
+api_changed
+
+timer_fired
+
+goal_due
+
+capsule_rebuild
+
+semantic_consolidation
+
+emotion_decay_tick
+
+Self-scheduling is just writing a new scheduled_events row or pending_actions row.
+
+watchdog is a reasonable file-event choice because it is built for filesystem monitoring across platforms. APScheduler is acceptable later if you want library-managed recurring schedules; it supports persistent storage, including SQLite. I would still keep schedules in your own schema because schedules are part of the mind’s state, not just an execution convenience.
+
+10) Model router
+
+Keep the first router rule-based, not self-improving.
+
+def pick_model(task: TaskSpec) -> ModelRef:
+    if task.kind in {
+        "classify", "triage", "dedupe", "short_summary",
+        "memory_distill_draft", "capsule_diff", "sentiment"
+    }:
+        return CHEAP
+
+    if task.kind in {"code", "patch", "test_fix", "schema_migration"}:
+        return CODE
+
+    if task.user_waiting and task.stakes >= 0.7:
+        return STRONG
+
+    if task.requires_multi_step_reasoning:
+        return STRONG
+
+    if task.affects_identity or task.affects_relationships:
+        return STRONG
+
+    if task.affects_deadlines or task.is_irreversible:
+        return STRONG
+
+    return CHEAP
+
+I would define:
+
+CHEAP = Haiku / GPT-4o-mini class
+
+STRONG = Claude Opus / GPT-5 class
+
+CODE = GPT-5/Codex or Claude Code class
+
+With one escalation rule:
+
+start on CHEAP
+
+escalate to STRONG when confidence < 0.65, ambiguity is high, there are conflicting goals, or the answer would update identity/relationship state
+
+route to CODE only when the output must be executable code, tests, patches, or schema changes
+
+Use Anthropic as the primary reasoning provider because that is already your chosen cognition path, and use the official Anthropic SDK rather than raw HTTP.
+
+11) OpenClaw bridge
+
+This is the critical seam.
+
+Inbound: OpenClaw -> daemon
+
+Use an OpenClaw internal hook on message:preprocessed, not message:received, for ordinary conversation ingress. message:preprocessed fires after media/link understanding so the daemon sees the enriched body. Also subscribe to message:sent for delivery confirmation and gateway:startup for registration/bootstrap events.
+
+Minimal hook:
+
+// ops/openclaw/bridge-hook/handler.ts
+const handler = async (event) => {
+  if (event.type !== "message" || event.action !== "preprocessed") return;
+
+  await fetch("http://127.0.0.1:8765/v1/openclaw/inbound", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-vex-bridge-token": process.env.VEX_BRIDGE_TOKEN!,
+    },
+    body: JSON.stringify({
+      channel: event.context.channelId,
+      accountId: event.context.accountId,
+      conversationId: event.context.conversationId,
+      messageId: event.context.messageId,
+      body: event.context.bodyForAgent ?? event.context.body ?? "",
+      transcript: event.context.transcript ?? null,
+      metadata: event.context.metadata ?? {},
+      ts: Date.now(),
+    }),
+  });
+};
+
+export default handler;
+
+That hook model is exactly what OpenClaw’s internal hook system is for.
+
+Outbound: daemon -> OpenClaw
+
+Use a real Gateway client, not shell-outs to openclaw ... on every turn. OpenClaw’s Gateway is already a typed WebSocket API with a required connect handshake, request/response frames, events, auth tokens, and idempotency for side-effecting methods like send and agent.
+
+For fast wins, support both:
+
+HTTP hook calls to /hooks/wake and /hooks/agent for simple wakeups and delegations
+
+Gateway WebSocket client for direct control-plane operations and future richer integrations
+
+Tool delegation
+
+Map daemon action kinds to OpenClaw surfaces:
+
+send_message -> message
+
+browse_web -> browser
+
+run_command_on_host_or_node -> nodes / exec policy
+
+schedule_gateway_side_job -> cron
+
+restart_or_reconfigure_gateway -> gateway
+
+OpenClaw’s built-in tool inventory already groups these surfaces that way.
+
+My recommendation is to keep the daemon’s planner tool-agnostic:
+
+Action(
+    kind="browse_web",
+    target={"url": "..."},
+    bridge="openclaw",
+    tool="browser"
+)
+
+Then the bridge layer turns that into the actual gateway call.
+
+12) What to build first
+
+Build this in order:
+
+Service skeleton
+
+WSL2/systemd service
+
+health endpoint
+
+structured logs
+
+startup recovery
+
+SQLite core
+
+migrations
+
+identity core
+
+people/relationships
+
+projects/goals
+
+pending actions
+
+scheduled events
+
+OpenClaw bridge
+
+inbound hook
+
+outbound message send
+
+one tool path, probably browser or message
+
+Context builder
+
+identity capsule
+
+active goals
+
+relationship for current sender
+
+recent episodic context
+
+FTS retrieval
+
+Model router
+
+cheap / strong / code
+
+escalation rules
+
+Anthropic strong path first
+
+Scheduler + autonomy
+
+one-shot timers
+
+recurring timers
+
+file watchers
+
+self-scheduled follow-ups
+
+Memory consolidation
+
+turn raw messages/events into semantic memory
+
+rebuild capsule after meaningful deltas
+
+That sequence gets you a real persistent mind fastest.
+
+13) What to defer
+
+Defer these until the daemon is already useful:
+
+fancy emotion theory
+
+graph databases
+
+external vector DBs
+
+multi-host clustering
+
+auto-generated long-term goals
+
+self-modifying code
+
+autonomous browser polling of everything
+
+multimodal memory unless you actually need it
+
+MVP emotion can be:
+
+valence
+
+intensity
+
+trigger summary
+
+exponential decay
+
+MVP relationship model can be:
+
+trust
+
+familiarity
+
+sentiment
+
+preferences/boundaries JSON
+
+Both are enough to produce continuity without pseudo-psychology.
+
+14) Estimated MVP time
+
+For one experienced engineer working full-time:
+
+3–5 days: service skeleton, DB, migrations, logging, recovery
+
+4–6 days: OpenClaw bridge + inbound/outbound flow
+
+4–6 days: context builder + identity capsule + FTS retrieval
+
+3–5 days: model router + action queue + basic scheduler
+
+3–5 days: polishing, tests, crash recovery, observability
+
+So:
+
+First working MVP: about 2–3 weeks
+
+Daily-driver MVP you can trust: about 4–6 weeks
+
+That second number is the real one.
+
+15) My final opinion
+
+Build the daemon as the sovereign mind, and let OpenClaw become a body adapter.
+
+The decisive choices are:
+
+Python
+
+WSL2 on the Windows host
+
+systemd supervision
+
+SQLite as sovereign state
+
+FTS5 + stored embeddings
+
+custom durable scheduler/event bus
+
+OpenClaw internal hook for ingress
+
+OpenClaw WS/HTTP bridge for tools and delivery
+
+identity capsule as derived state, not canonical truth
+
+That gives you a persistent AI substrate that can survive OpenClaw restarts, model swaps, UI changes, and even host migration with minimal identity loss.

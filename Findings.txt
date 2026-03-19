@@ -1,0 +1,33 @@
+Findings
+
+P1 Phase A overstates what it buys you. A SQLite DB plus transcript tailer gives Vex durable state, but not runtime continuity by itself. OpenClaw still rebuilds the prompt each run from its normal context path, so Vex will not actually “survive session death” until there is a read path back into the turn loop via a hook, bootstrap export, or the context engine. The relevant seams are in Agents_Fundamentals.txt and Agents_Fundamentals.txt.
+
+P1 Phase B is riskier than the writeup implies. Once vex-mind owns assemble(), it is not a light additive layer; it becomes the context builder. A thin first version can silently drop conversation state, tool context, or important transcript structure. I would not make the first plugin milestone “minimal assembly”; I’d make it “parity assembly with tests,” or use a lighter interim bridge first. The context-engine contract is described in Agents_Fundamentals.txt.
+
+P1 The transcript tailer should not be the primary live ingress. It is great for backfill and crash recovery, but brittle as the main event source because session files rotate, compact, reset, and live under gateway-owned paths that vary by state dir, profile, and host. The gateway is the source of truth, so live ingest should come from hooks or WS events; JSONL tailing should be secondary. See Agents_Sessions and memory.txt.
+
+P2 The plan is drifting toward two schedulers. If vexd owns scheduled_events and OpenClaw cron also owns exact-time behavior, you will eventually hit duplicate wakes, missed dedupe, or split-brain debugging. Pick one source of truth now. My recommendation: vexd owns scheduling; OpenClaw cron is only for gateway-local tasks you explicitly choose to mirror. Cron behavior is in Tools_Automation.txt.
+
+P2 ownsCompaction: true needs replay evidence before rollout. Once you flip that on, you own overflow recovery, not just nicer summaries. A bad compaction pass can break turns entirely. Build a replay harness from saved transcripts and compare outcomes before making it the default.
+
+P2 Step 3 needs provenance, not just seeded truth. “Seed identity_core with who I am right now” and “seed relationships with what I know” is fine as bootstrap data, but dangerous as canonical fact unless each field tracks source, confidence, last-confirmed time, and whether it is user-authored vs inferred. Otherwise first-night assumptions harden into doctrine.
+
+P3 Seven async loops is probably too much for week 1. It is an impressive architecture, but for the first milestone it increases failure surface faster than it increases capability. I’d start with four: ingest, scheduler, action worker, and API/health. Add consolidation, projection, and background cognition only after you have restart and idempotency telemetry.
+
+Testing Gaps
+
+You need a replay corpus before the plugin and especially before custom compaction.
+You need idempotency tests for transcript ingestion across restart, compaction, and session reset.
+You need scheduler dedupe tests if both vexd and OpenClaw can wake work.
+You need golden tests for identity capsule generation so “same Vex” is measured, not assumed.
+You need path-discovery tests for WSL/profile/remote-gateway setups, because ~/.openclaw/agents/vex/sessions/*.jsonl is too specific to be trusted as a constant.
+Open Questions
+
+Is the gateway guaranteed to run in the same WSL distro as vexd, or could it be remote later?
+Do you want an interim continuity bridge before the context engine, or are you okay with continuity being mostly “shadow persistence” until Phase B?
+Which system is authoritative for future tasks: vexd or OpenClaw cron?
+Bottom Line
+
+The direction is strong. The “restart-safe, externally engineered continuity” framing is the right one, and the two-process organism idea still looks like the best path.
+
+The main correction I’d make is this: move an interim read-path earlier, downgrade transcript tailing from primary to secondary, and treat custom compaction as the last dangerous step, not the next obvious one. If you want, I can turn this into a tightened v2 plan with the risky parts reordered.

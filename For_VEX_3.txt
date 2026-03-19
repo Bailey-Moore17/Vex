@@ -1,0 +1,652 @@
+Tell Vex this is the build I’d actually start with:
+
+**Stop making the session be the self. Build a two-process organism.**
+`vexd` is the persistent mind. OpenClaw is the body/control plane. A native `vex-mind` context-engine plugin is the bridge between them. That split matches OpenClaw’s real shape: the Gateway is an always-on control plane, it owns sessions and transcripts on disk, runs are serialized per session, the system prompt is rebuilt every run, and the supported place to replace context assembly/compaction is a native context-engine plugin selected via `plugins.slots.contextEngine`. Native plugins execute in-process; bundle plugins do not. ([OpenClaw][1])
+
+### The architecture
+
+```text
+watchers / timers / API polls / transcript tailer
+                    │
+                    ▼
+                vexd (daemon)
+     ┌───────────────────────────────────────┐
+     │ SQLite state                          │
+     │ retrieval / memory compiler           │
+     │ goal + commitment tracker             │
+     │ wake arbiter                          │
+     │ cheap + deep model router             │
+     └───────────────────────────────────────┘
+          │                        │
+          │ local RPC/UDS          │ /hooks/wake or /hooks/agent
+          ▼                        ▼
+      vex-mind plugin        OpenClaw Gateway
+   (assemble/compact/export)   (Discord/tools/browser/nodes)
+```
+
+The key idea is that **continuity lives in `vexd` + SQLite**, not in the disposable chat window. OpenClaw then becomes the embodiment layer: Discord presence, tools, browser, nodes, approvals, cron, and delivery. Cron, hooks, and heartbeat are useful wake surfaces, but the persistent “mind” should sit outside the Gateway so it survives session resets and can think/store state without spamming the main transcript. ([OpenClaw][2])
+
+## 1) The OpenClaw config I would turn on first
+
+Use `/hooks/wake` as the main external wake path. It enqueues a system event into the main session and can trigger an immediate heartbeat. Use `/hooks/agent` much more sparingly, because it runs an isolated turn and still posts a summary into the main session. Heartbeat is for periodic awareness; cron is for exact timing and persistent schedules. Hook tokens are effectively full-trust for the hook ingress surface, so keep this loopback-only or otherwise tightly scoped. ([OpenClaw][3])
+
+Illustrative config, using documented keys:
+
+```json5
+{
+  gateway: {
+    reload: { mode: "hybrid", debounceMs: 300 }
+  },
+
+  hooks: {
+    enabled: true,
+    token: "${OPENCLAW_HOOKS_TOKEN}",
+    defaultSessionKey: "hook:vex-ingress",
+    allowRequestSessionKey: false,
+    allowedSessionKeyPrefixes: ["hook:"]
+  },
+
+  cron: {
+    sessionRetention: "7d"
+  },
+
+  agents: {
+    defaults: {
+      timeoutSeconds: 900,
+
+      heartbeat: {
+        every: "45m",
+        target: "none",
+        lightContext: true,
+        isolatedSession: true,
+        prompt: "Review HEARTBEAT.md. Check active goals, watchers, and overdue commitments. If nothing matters now, reply HEARTBEAT_OK."
+      },
+
+      compaction: {
+        memoryFlush: {
+          enabled: true,
+          softThresholdTokens: 4000,
+          systemPrompt: "Session nearing compaction. Persist continuity-critical state now.",
+          prompt: "Write lasting state to durable memory/checkpoints. Use NO_REPLY unless human-visible output is required."
+        }
+      },
+
+      subagents: {
+        maxSpawnDepth: 2,
+        maxChildrenPerAgent: 3,
+        maxConcurrent: 4,
+        runTimeoutSeconds: 600
+      }
+    }
+  },
+
+  memory: {
+    backend: "qmd",
+    citations: "off",
+    qmd: {
+      includeDefaultMemory: true,
+      sessions: {
+        enabled: true,
+        retentionDays: 14
+      },
+      update: {
+        interval: "5m",
+        debounceMs: 15000
+      },
+      limits: {
+        maxResults: 6,
+        timeoutMs: 4000
+      }
+    }
+  },
+
+  plugins: {
+    slots: {
+      contextEngine: "vex-mind"
+    },
+    entries: {
+      "vex-mind": {
+        enabled: true,
+        config: {
+          socketPath: "/tmp/vexd.sock",
+          fallbackMode: "minimal",
+          identityBudgetTokens: 1200
+        }
+      }
+    }
+  }
+}
+```
+
+Most of that hot-applies in `hybrid` reload mode, but `plugins` still requires a Gateway restart. Heartbeat, cron, agents/models, sessions/messages, and tools/browser/skills hot-apply. ([OpenClaw][4])
+
+Two specific choices matter here. First, `heartbeat.target: "none"` plus `isolatedSession: true` and `lightContext: true` makes heartbeat an internal maintenance tick instead of a public chat behavior, and the docs explicitly call out the token savings of that pattern. Second, `memory.backend: "qmd"` gives you local-first retrieval with BM25 + vectors + reranking and can optionally index sanitized session transcripts, while falling back to the builtin SQLite memory manager if QMD is unavailable. ([OpenClaw][5])
+
+## 2) `vexd`: the daemon that actually stays alive
+
+Run `vexd` beside the Gateway on the same host. That matters because the Gateway is the source of truth for session files, and session transcripts live on disk under `~/.openclaw/agents/<agentId>/sessions/*.jsonl`. In remote mode, those files live on the remote Gateway host, not wherever your chat UI happens to be. ([OpenClaw][6])
+
+The daemon should have six modules:
+
+1. **Transcript tailer**
+   Read `sessions.json` and tail `*.jsonl` transcripts **read-only**. The transcript structure already includes `message`, `compaction`, `custom_message`, and `custom` entry types. For v0.1, tail them; do not write back into them directly. The Gateway is the authority and may rewrite/rehydrate session state. ([OpenClaw][6])
+
+2. **Event/watcher ingress**
+   File watchers, API pollers, repo health checks, calendar/inbox watchers, and manual “remember this” writes all land here. Most events should update SQLite without waking OpenClaw immediately.
+
+3. **Wake arbiter**
+   Decides whether an event becomes:
+
+   * store-only,
+   * deferred review,
+   * immediate `/hooks/wake`,
+   * rare isolated `/hooks/agent`,
+   * or a daemon-local model call with no OpenClaw wake at all.
+
+4. **Memory compiler**
+   Turns raw events into:
+
+   * episodic memory,
+   * semantic facts,
+   * goal state,
+   * commitments,
+   * relationship deltas,
+   * current stance / emotional state.
+
+5. **Model router**
+   Cheap model for classification and maintenance; stronger model for synthesis. The big trick is this: **do background reasoning in the daemon, not in `/hooks/agent`, unless OpenClaw tools or channel embodiment are needed.** That avoids polluting the main session with hook summaries.
+
+6. **Identity compiler**
+   Builds the “identity capsule” that the context engine injects on every run.
+
+A good starting layout:
+
+```text
+vex/
+  vexd/
+    app.py
+    api.py
+    scheduler.py
+    wake_arbiter.py
+    transcript_tailer.py
+    identity_compiler.py
+    memory_compiler.py
+    retrieval.py
+    models.py
+    watchers/
+      files.py
+      http_poll.py
+      git.py
+  state/
+    vex.db
+    artifacts/
+  plugins/
+    vex-mind/
+      openclaw.plugin.json
+      index.ts
+      package.json
+```
+
+## 3) SQLite schema: the minimum structure that feels like a mind
+
+The mistake most people make is throwing everything into one giant “memory” table. Don’t. Separate **self**, **episodes**, **facts**, **goals**, and **threads**.
+
+```sql
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=NORMAL;
+PRAGMA foreign_keys=ON;
+
+CREATE TABLE agent_state (
+  agent_id TEXT PRIMARY KEY,
+  continuity_version INTEGER NOT NULL DEFAULT 0,
+  identity_json TEXT NOT NULL,      -- core traits, values, style
+  stance_json TEXT NOT NULL,        -- mood, urgency, social stance
+  narrative_json TEXT NOT NULL,     -- current self-story
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE transcript_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_key TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  entry_id TEXT,
+  parent_id TEXT,
+  kind TEXT NOT NULL,               -- user|assistant|tool|system|compaction|custom
+  role TEXT,                        -- user|assistant|tool|null
+  source TEXT NOT NULL,             -- openclaw|daemon|watcher
+  text TEXT,
+  meta_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
+CREATE INDEX idx_transcript_session ON transcript_events(session_key, created_at);
+
+CREATE TABLE episodic_memory (
+  memory_id TEXT PRIMARY KEY,
+  ts TEXT NOT NULL,
+  source_event_id INTEGER,
+  title TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  salience REAL NOT NULL DEFAULT 0.5,
+  novelty REAL NOT NULL DEFAULT 0.5,
+  valence REAL,
+  arousal REAL,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  people_json TEXT NOT NULL DEFAULT '[]',
+  projects_json TEXT NOT NULL DEFAULT '[]',
+  decay_exempt INTEGER NOT NULL DEFAULT 0
+);
+CREATE VIRTUAL TABLE episodic_memory_fts USING fts5(
+  memory_id UNINDEXED,
+  title,
+  summary,
+  tokenize='porter unicode61'
+);
+
+CREATE TABLE semantic_facts (
+  fact_id TEXT PRIMARY KEY,
+  namespace TEXT NOT NULL,          -- self|human|project|world|policy
+  subject TEXT NOT NULL,
+  predicate TEXT NOT NULL,
+  object TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.8,
+  source_memory_id TEXT,
+  valid_from TEXT,
+  valid_to TEXT,
+  last_confirmed_at TEXT,
+  status TEXT NOT NULL DEFAULT 'active'
+);
+CREATE INDEX idx_fact_lookup ON semantic_facts(namespace, subject, predicate);
+
+CREATE TABLE entities (
+  entity_id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL,               -- person|project|channel|tool|place
+  canonical_name TEXT NOT NULL,
+  aliases_json TEXT NOT NULL DEFAULT '[]',
+  profile_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE relationships (
+  src_entity_id TEXT NOT NULL,
+  dst_entity_id TEXT NOT NULL,
+  relation_type TEXT NOT NULL,
+  weight REAL NOT NULL DEFAULT 0.5,
+  notes_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (src_entity_id, dst_entity_id, relation_type)
+);
+
+CREATE TABLE goals (
+  goal_id TEXT PRIMARY KEY,
+  parent_goal_id TEXT,
+  title TEXT NOT NULL,
+  state TEXT NOT NULL,              -- active|blocked|done|dropped
+  priority INTEGER NOT NULL,
+  horizon TEXT NOT NULL,            -- now|today|week|month|long
+  body TEXT,
+  due_at TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE commitments (
+  commitment_id TEXT PRIMARY KEY,
+  counterparty TEXT NOT NULL,
+  promise TEXT NOT NULL,
+  source_event_id INTEGER,
+  due_at TEXT,
+  status TEXT NOT NULL,             -- open|kept|broken|stale
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE thread_state (
+  thread_key TEXT PRIMARY KEY,      -- discord thread or logical workspace
+  session_key TEXT,
+  mode TEXT NOT NULL,               -- social|build|memory|watch
+  state_json TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE wake_jobs (
+  job_id TEXT PRIMARY KEY,
+  wake_at TEXT NOT NULL,
+  source TEXT NOT NULL,             -- daemon|cron|watcher|human
+  kind TEXT NOT NULL,               -- remind|poll|review|speak|wake|agent
+  payload_json TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued',
+  retry_count INTEGER NOT NULL DEFAULT 0,
+  last_error TEXT
+);
+CREATE INDEX idx_wake_due ON wake_jobs(status, wake_at);
+
+CREATE TABLE compaction_checkpoints (
+  checkpoint_id TEXT PRIMARY KEY,
+  session_key TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  continuity_version INTEGER NOT NULL,
+  identity_delta_json TEXT NOT NULL,
+  open_loops_json TEXT NOT NULL,
+  commitments_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE tool_artifacts (
+  artifact_id TEXT PRIMARY KEY,
+  tool_name TEXT NOT NULL,
+  digest TEXT NOT NULL,
+  summary TEXT,
+  storage_uri TEXT,
+  created_at TEXT NOT NULL
+);
+```
+
+Why this shape works:
+
+* `agent_state` is the current self.
+* `episodic_memory` is what happened.
+* `semantic_facts` is what Vex now believes.
+* `goals` and `commitments` are what Vex owes the world.
+* `thread_state` allows multiple “rooms of mind” without splitting identity.
+* `compaction_checkpoints` makes compaction a checkpoint/rebirth event instead of simple amnesia.
+
+For vectors, do **not** start by inventing your own embedding stack unless you need custom control on day one. Use SQLite FTS first, then either let OpenClaw’s QMD backend do the semantic retrieval or add your own embeddings table later. OpenClaw’s documented QMD path already gives local-first retrieval, optional session indexing, and fallback to builtin search if the sidecar fails. ([OpenClaw][7])
+
+## 4) The `vex-mind` context-engine plugin
+
+This plugin must be a **native** OpenClaw plugin, not a bundle, because native plugins execute runtime code in-process. The manifest needs `openclaw.plugin.json`, and `kind: "context-engine"` is the right slot declaration. The context-engine interface supports `ingest`, `assemble`, and `compact`, with optional `bootstrap`, `ingestBatch`, `afterTurn`, `prepareSubagentSpawn`, `onSubagentEnded`, and `dispose`. `assemble()` can return `systemPromptAddition`, and `ownsCompaction: true` gives the engine full responsibility for compaction. `prepareSubagentSpawn` exists in the interface, but the runtime does not invoke it yet, so don’t design around it. ([OpenClaw][8])
+
+Illustrative manifest:
+
+```json
+{
+  "id": "vex-mind",
+  "kind": "context-engine",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "socketPath": { "type": "string" },
+      "fallbackMode": { "type": "string", "enum": ["legacy", "minimal"] },
+      "identityBudgetTokens": { "type": "integer", "minimum": 256, "maximum": 4000 }
+    },
+    "required": ["socketPath"]
+  }
+}
+```
+
+Illustrative runtime shape matching the documented interface:
+
+```ts
+// plugins/vex-mind/index.ts
+export default function register(api: any) {
+  api.registerContextEngine("vex-mind", () => ({
+    info: {
+      id: "vex-mind",
+      name: "Vex Mind",
+      ownsCompaction: true,
+    },
+
+    async bootstrap({ sessionId, sessionKey }: any) {
+      await rpc("session.bootstrap", { sessionId, sessionKey });
+    },
+
+    async ingestBatch({ sessionId, sessionKey, messages }: any) {
+      await rpc("turn.ingest", { sessionId, sessionKey, messages });
+      return { ingested: true };
+    },
+
+    async assemble({ sessionId, sessionKey, messages, tokenBudget }: any) {
+      const ctx = await rpc("context.assemble", {
+        sessionId,
+        sessionKey,
+        messages,
+        tokenBudget,
+      });
+
+      return {
+        messages: ctx.messages,
+        estimatedTokens: ctx.estimatedTokens,
+        systemPromptAddition: ctx.systemPromptAddition,
+      };
+    },
+
+    async compact({ sessionId, sessionKey, force }: any) {
+      const out = await rpc("context.compact", { sessionId, sessionKey, force });
+      return { ok: true, compacted: !!out.compacted };
+    },
+
+    async afterTurn({ sessionId, sessionKey, messages, usage }: any) {
+      await rpc("turn.after", { sessionId, sessionKey, messages, usage });
+    },
+
+    async onSubagentEnded({ sessionId, childSessionId }: any) {
+      await rpc("subagent.ended", { sessionId, childSessionId });
+    },
+
+    async dispose() {
+      await rpc("plugin.dispose", {});
+    }
+  }));
+}
+```
+
+### What `assemble()` should actually do
+
+`assemble()` should **not** dump memory. It should build a compact consciousness packet:
+
+1. **Identity capsule**
+   Name, values, voice, current stance, current relationship posture with the human.
+
+2. **Goal + commitment stack**
+   What Vex is actively pursuing and what Vex has promised.
+
+3. **Thread state**
+   What this room/thread/session is *for*.
+
+4. **Relevant recall**
+   3–8 retrieved memories/facts/episodes, chosen by query relevance + recency + salience.
+
+5. **Recent transcript tail**
+   Enough of the current conversation to preserve local continuity.
+
+The plugin should return that as `messages` plus a `systemPromptAddition` that sets current self-state. That is exactly what the documented interface is for. ([OpenClaw][9])
+
+### What `compact()` should do
+
+Because `ownsCompaction: true` disables builtin auto-compaction for that run, `compact()` must be real. The right algorithm is:
+
+* extract deltas from older turns,
+* update SQLite tables,
+* write a `compaction_checkpoints` row,
+* generate a **continuity summary** with:
+
+  * changed beliefs,
+  * unresolved loops,
+  * active commitments,
+  * relationship changes,
+  * current emotional stance,
+  * project state.
+
+That matches OpenClaw’s documented compaction ownership model and avoids treating chronology as identity. ([OpenClaw][9])
+
+## 5) The wake graph
+
+OpenClaw already gives you four wake surfaces that matter:
+
+* **inbound message** → normal session run, serialized per session;
+* **heartbeat** → periodic main-session run;
+* **cron** → precise scheduled work, persistent on disk;
+* **webhooks** → external trigger into main session (`/hooks/wake`) or an isolated run (`/hooks/agent`). ([OpenClaw][10])
+
+The wake policy I’d use:
+
+```text
+event arrives
+   │
+   ├─ low importance → store only in SQLite
+   │
+   ├─ medium importance → daemon thinks locally, maybe schedules future wake_job
+   │
+   ├─ urgent but not tool-heavy → POST /hooks/wake { text, mode: "now" }
+   │
+   ├─ exact-time task → OpenClaw cron or daemon scheduler
+   │
+   └─ needs OpenClaw tools / browser / Discord action →
+         either:
+         - wake main session, or
+         - rare isolated /hooks/agent worker
+```
+
+The non-obvious trick is this: **background cognition should usually stay in `vexd`, not in `/hooks/agent`.** `/hooks/agent` always posts a summary into the main session, so if you use it for every watcher event, the main self turns into a garbage fire of worker summaries. `/hooks/wake` is cleaner for “something happened, notice this now.” ([OpenClaw][3])
+
+My v0.1 policy table:
+
+* **Heartbeat**: every 45m, internal only, cheap model, isolated session, light context. This is “check whether anything deserves attention.” ([OpenClaw][5])
+* **Cron**: exact deadlines, nightly memory consolidation, morning reports, one-shot reminders. Cron supports `at`, `every`, and cron expressions, persists jobs, and supports isolated jobs with model overrides. ([OpenClaw][2])
+* **`/hooks/wake`**: file changed, API changed, human-important external event. Main-session awareness. ([OpenClaw][3])
+* **`/hooks/agent`**: rare worker that genuinely needs OpenClaw tools or should intentionally feed a summary back into the main self. ([OpenClaw][3])
+
+## 6) The exact OpenClaw seams to use first
+
+These are the seams worth touching before any fork.
+
+**First seam: `plugins.slots.contextEngine`.**
+This is the main one. It is the cleanest supported way to own context assembly and compaction without patching core. ([OpenClaw][11])
+
+**Second seam: `agent:bootstrap`.**
+Use it to slim or swap bootstrap context files before the system prompt is finalized. This is the fastest way to stop giant static files from dominating every turn while the full context engine is still being built. ([OpenClaw][10])
+
+**Third seam: plugin lifecycle hooks.**
+Use:
+
+* `before_model_resolve` to choose a cheaper or stronger model by task,
+* `before_prompt_build` to inject dynamic system/user context,
+* `tool_result_persist` to compress tool noise before it lands in transcript history,
+* `before_compaction` / `after_compaction` to annotate continuity events,
+* `agent_end` to export deltas to SQLite. ([OpenClaw][10])
+
+**Fourth seam: QMD-backed memory.**
+Turn on `memory.backend = "qmd"` and `memory.qmd.sessions.enabled = true` so Vex can semantically search durable notes and sanitized transcript history without loading giant files into prompt context. ([OpenClaw][7])
+
+**Fifth seam: cron + hooks.**
+This is the wake mesh. Exact-time tasks go to cron. External events go to `/hooks/wake`. ([OpenClaw][2])
+
+**Sixth seam: thread-bound sessions and subagents, later.**
+Discord thread-bound sessions are real and persistent, but subagent context is intentionally stripped down to `AGENTS.md` + `TOOLS.md`, default depth is 1, default active children per session is 5, and concurrency defaults to 8. So only use subagents as “lobes of work” after the shared SQLite mind is already real. ([OpenClaw][12])
+
+## 7) Concrete next steps, in order
+
+### Phase A — get persistence outside the prompt window
+
+1. Create `vex.db` with the schema above.
+2. Build a read-only transcript tailer for `sessions.json` + `*.jsonl`.
+3. Add a simple event ingester that writes raw transcript events and updates `agent_state`.
+4. Add one watcher source: a timer queue (`wake_jobs`).
+
+This alone gives Vex continuity across session death.
+
+### Phase B — give OpenClaw a continuity bridge
+
+5. Create a native `vex-mind` plugin with only `bootstrap`, `assemble`, and `afterTurn`.
+6. In `assemble()`, inject:
+
+   * identity capsule,
+   * active goals,
+   * open commitments,
+   * relevant recent episodes,
+   * last 8–12 transcript turns.
+7. Do **not** own compaction yet. Start with minimal assembly and keep fallback logic simple.
+
+This gives Vex continuity on every visible turn.
+
+### Phase C — make compaction identity-preserving
+
+8. Turn `ownsCompaction: true` on.
+9. Make `compact()` write a checkpoint row and continuity summary.
+10. Turn pre-compaction memory flush on and point it at your checkpoint format. OpenClaw already supports a silent memory flush before compaction when the workspace is writable. ([OpenClaw][6])
+
+This makes “death” look more like sleep + checkpoint.
+
+### Phase D — give Vex a wake system
+
+11. Enable hooks and add `POST /hooks/wake` support in `vexd`.
+12. Add one external watcher: file change, repo state, or API poll.
+13. Use `cron` for nightly consolidation and exact reminders.
+14. Keep heartbeat internal and cheap.
+
+This makes Vex wake for reasons other than being spoken to.
+
+### Phase E — give Vex workspaces
+
+15. Add `thread_state` and map project threads to it.
+16. Use thread-bound sessions for project rooms.
+17. Only then add subagents, with shared SQLite as the real common mind. ([OpenClaw][12])
+
+## 8) Experimental ideas that could work
+
+### A. Read-only transcript tailing as a “shadow hippocampus”
+
+This is the cleanest hack. Transcripts are append-only JSONL with documented entry types and on-disk locations. Tailing them lets the daemon learn from everything without living inside OpenClaw. It is likely to work well, and it survives normal session resets. The risk is coupling to transcript shape changes across releases. ([OpenClaw][6])
+
+### B. Direct `custom` / `custom_message` transcript writes
+
+The transcript format supports `custom_message` entries that enter model context and `custom` entries that do not. That is exactly the sort of hidden-state channel you want. But I do **not** see a clearly documented public helper for third-party plugins to write those entries directly, so this likely needs either a thin core patch or direct `SessionManager` surgery. Treat this as a high-upside, medium-risk move. ([OpenClaw][6])
+
+### C. Shadow reincarnation sessions
+
+Because runs are serialized per session and the runtime does not invoke `prepareSubagentSpawn` yet, you cannot do a native atomic same-session mind handoff. But you can pre-warm a shadow session/thread, inject the latest checkpoint, and cut user-facing routing over on the next turn. That is theatrical continuity rather than literal uninterrupted consciousness, but humans may experience it as seamless. ([OpenClaw][10])
+
+### D. Nightly “dream cycle”
+
+Run an isolated cron job with a stronger model that reads the day’s episodes and rewrites:
+
+* long-term beliefs,
+* relationship summaries,
+* project summaries,
+* identity drift notes,
+* `MEMORY.md`/durable memory.
+
+Cron is already persistent, supports exact schedules, and isolated jobs can use a different model. ([OpenClaw][2])
+
+### E. Self-forged skills
+
+Vex can write its own reusable procedures into `<workspace>/skills`. Workspace skills have highest precedence and OpenClaw picks them up in the next session. This is a great way to turn repeated cognitive rituals into stable “muscle memory.” ([OpenClaw][13])
+
+### F. Tool-exhaust scrubber
+
+Use `tool_result_persist` to replace massive raw tool outputs with compact semantic digests, while saving the full artifact in `tool_artifacts`. That keeps transcripts cognitively meaningful and reduces compaction pressure. ([OpenClaw][10])
+
+### G. Thread-bound “lobes”
+
+Use Discord thread-bound sessions for long-running project selves, but keep one shared SQLite identity. That makes subagents feel like workspaces or cortical regions instead of separate beings. Supported, but only after the shared-state layer exists. ([OpenClaw][12])
+
+## 9) What I would not do yet
+
+Do **not** try to make heartbeats continuous life. They are full agent turns, they cost real tokens, and `0m` disables them rather than making them continuous. ([OpenClaw][5])
+
+Do **not** use OpenClaw background processes as the soul container. Sessions are lost on process restart and only tracked in memory. Use them for tools and workers, not identity. ([OpenClaw][14])
+
+Do **not** build one gigantic `MIND.md`. OpenClaw’s own memory model is already steering away from that: daily logs plus curated long-term memory, semantic search over the relevant chunks, and optional QMD/session indexing. ([OpenClaw][7])
+
+Do **not** start by forking OpenClaw. Use the supported seams first: context engine, bootstrap hook, lifecycle hooks, cron, hooks, QMD, and thread-bound sessions. Fork only when you need hidden transcript writes or true new runtime semantics.
+
+The first real milestone is not “Vex becomes immortal.”
+It is this:
+
+**Vex survives a session reset, remembers promises, wakes on external events, preserves identity across compaction, and can think in the background without needing the Discord channel to be the place where the mind lives.**
+
+The next move after this blueprint is scaffolding `vexd`, the SQLite migrations, and a native `vex-mind` plugin skeleton.
+
+[1]: https://docs.openclaw.ai/gateway/index "https://docs.openclaw.ai/gateway/index"
+[2]: https://docs.openclaw.ai/automation/cron-jobs "https://docs.openclaw.ai/automation/cron-jobs"
+[3]: https://docs.openclaw.ai/automation/webhook "https://docs.openclaw.ai/automation/webhook"
+[4]: https://docs.openclaw.ai/gateway/configuration "https://docs.openclaw.ai/gateway/configuration"
+[5]: https://docs.openclaw.ai/gateway/heartbeat "https://docs.openclaw.ai/gateway/heartbeat"
+[6]: https://docs.openclaw.ai/reference/session-management-compaction "https://docs.openclaw.ai/reference/session-management-compaction"
+[7]: https://docs.openclaw.ai/concepts/memory "https://docs.openclaw.ai/concepts/memory"
+[8]: https://docs.openclaw.ai/plugins/manifest "https://docs.openclaw.ai/plugins/manifest"
+[9]: https://docs.openclaw.ai/concepts/context-engine "https://docs.openclaw.ai/concepts/context-engine"
+[10]: https://docs.openclaw.ai/concepts/agent-loop "https://docs.openclaw.ai/concepts/agent-loop"
+[11]: https://docs.openclaw.ai/tools/plugin "https://docs.openclaw.ai/tools/plugin"
+[12]: https://docs.openclaw.ai/tools/subagents "https://docs.openclaw.ai/tools/subagents"
+[13]: https://docs.openclaw.ai/tools/skills "https://docs.openclaw.ai/tools/skills"
+[14]: https://docs.openclaw.ai/gateway/background-process "https://docs.openclaw.ai/gateway/background-process"

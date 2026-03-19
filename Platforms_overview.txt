@@ -1,0 +1,784 @@
+latforms overview
+Windows (WSL2)
+OpenClaw on Windows is recommended via WSL2 (Ubuntu recommended). The CLI + Gateway run inside Linux, which keeps the runtime consistent and makes tooling far more compatible (Node/Bun/pnpm, Linux binaries, skills). Native Windows might be trickier. WSL2 gives you the full Linux experience — one command to install: wsl --install.
+Native Windows companion apps are planned.
+​
+Install (WSL2)
+Getting Started (use inside WSL)
+Install & updates
+Official WSL2 guide (Microsoft): https://learn.microsoft.com/windows/wsl/install
+​
+Native Windows status
+Native Windows CLI flows are improving, but WSL2 is still the recommended path.
+What works well on native Windows today:
+website installer via install.ps1
+local CLI use such as openclaw --version, openclaw doctor, and openclaw plugins list --json
+embedded local-agent/provider smoke such as:
+openclaw agent --local --agent main --thinking low -m "Reply with exactly WINDOWS-HATCH-OK."
+Current caveats:
+openclaw onboard --non-interactive still expects a reachable local gateway unless you pass --skip-health
+openclaw onboard --non-interactive --install-daemon and openclaw gateway install try Windows Scheduled Tasks first
+if Scheduled Task creation is denied, OpenClaw falls back to a per-user Startup-folder login item and starts the gateway immediately
+if schtasks itself wedges or stops responding, OpenClaw now aborts that path quickly and falls back instead of hanging forever
+Scheduled Tasks are still preferred when available because they provide better supervisor status
+If you want the native CLI only, without gateway service install, use one of these:
+openclaw onboard --non-interactive --skip-health
+openclaw gateway run
+If you do want managed startup on native Windows:
+openclaw gateway install
+openclaw gateway status --json
+If Scheduled Task creation is blocked, the fallback service mode still auto-starts after login through the current user’s Startup folder.
+​
+Gateway
+Gateway runbook
+Configuration
+​
+Gateway service install (CLI)
+Inside WSL2:
+openclaw onboard --install-daemon
+Or:
+openclaw gateway install
+Or:
+openclaw configure
+Select Gateway service when prompted.
+Repair/migrate:
+openclaw doctor
+​
+Gateway auto-start before Windows login
+For headless setups, ensure the full boot chain runs even when no one logs into Windows.
+​
+1) Keep user services running without login
+Inside WSL:
+sudo loginctl enable-linger "$(whoami)"
+​
+2) Install the OpenClaw gateway user service
+Inside WSL:
+openclaw gateway install
+​
+3) Start WSL automatically at Windows boot
+In PowerShell as Administrator:
+schtasks /create /tn "WSL Boot" /tr "wsl.exe -d Ubuntu --exec /bin/true" /sc onstart /ru SYSTEM
+Replace Ubuntu with your distro name from:
+wsl --list --verbose
+​
+Verify startup chain
+After a reboot (before Windows sign-in), check from WSL:
+systemctl --user is-enabled openclaw-gateway
+systemctl --user status openclaw-gateway --no-pager
+​
+Advanced: expose WSL services over LAN (portproxy)
+WSL has its own virtual network. If another machine needs to reach a service running inside WSL (SSH, a local TTS server, or the Gateway), you must forward a Windows port to the current WSL IP. The WSL IP changes after restarts, so you may need to refresh the forwarding rule.
+Example (PowerShell as Administrator):
+$Distro = "Ubuntu-24.04"
+$ListenPort = 2222
+$TargetPort = 22
+
+$WslIp = (wsl -d $Distro -- hostname -I).Trim().Split(" ")[0]
+if (-not $WslIp) { throw "WSL IP not found." }
+
+netsh interface portproxy add v4tov4 listenaddress=0.0.0.0 listenport=$ListenPort `
+  connectaddress=$WslIp connectport=$TargetPort
+Allow the port through Windows Firewall (one-time):
+New-NetFirewallRule -DisplayName "WSL SSH $ListenPort" -Direction Inbound `
+  -Protocol TCP -LocalPort $ListenPort -Action Allow
+Refresh the portproxy after WSL restarts:
+netsh interface portproxy delete v4tov4 listenport=$ListenPort listenaddress=0.0.0.0 | Out-Null
+netsh interface portproxy add v4tov4 listenport=$ListenPort listenaddress=0.0.0.0 `
+  connectaddress=$WslIp connectport=$TargetPort | Out-Null
+Notes:
+SSH from another machine targets the Windows host IP (example: ssh user@windows-host -p 2222).
+Remote nodes must point at a reachable Gateway URL (not 127.0.0.1); use openclaw status --all to confirm.
+Use listenaddress=0.0.0.0 for LAN access; 127.0.0.1 keeps it local only.
+If you want this automatic, register a Scheduled Task to run the refresh step at login.
+​
+Step-by-step WSL2 install
+​
+1) Install WSL2 + Ubuntu
+Open PowerShell (Admin):
+wsl --install
+# Or pick a distro explicitly:
+wsl --list --online
+wsl --install -d Ubuntu-24.04
+Reboot if Windows asks.
+​
+2) Enable systemd (required for gateway install)
+In your WSL terminal:
+sudo tee /etc/wsl.conf >/dev/null <<'EOF'
+[boot]
+systemd=true
+EOF
+Then from PowerShell:
+wsl --shutdown
+Re-open Ubuntu, then verify:
+systemctl --user status
+​
+3) Install OpenClaw (inside WSL)
+Follow the Linux Getting Started flow inside WSL:
+git clone https://github.com/openclaw/openclaw.git
+cd openclaw
+pnpm install
+pnpm ui:build # auto-installs UI deps on first run
+pnpm build
+openclaw onboard
+Full guide: Getting Started
+​
+Windows companion app
+We do not have a Windows companion app yet. Contributions are welcome if you want contributions to make it happen.
+
+
+
+Platforms overview
+Raspberry Pi
+​
+Goal
+Run a persistent, always-on OpenClaw Gateway on a Raspberry Pi for ~$35-80 one-time cost (no monthly fees).
+Perfect for:
+24/7 personal AI assistant
+Home automation hub
+Low-power, always-available Telegram/WhatsApp bot
+​
+Hardware Requirements
+Pi Model	RAM	Works?	Notes
+Pi 5	4GB/8GB	✅ Best	Fastest, recommended
+Pi 4	4GB	✅ Good	Sweet spot for most users
+Pi 4	2GB	✅ OK	Works, add swap
+Pi 4	1GB	⚠️ Tight	Possible with swap, minimal config
+Pi 3B+	1GB	⚠️ Slow	Works but sluggish
+Pi Zero 2 W	512MB	❌	Not recommended
+Minimum specs: 1GB RAM, 1 core, 500MB disk
+Recommended: 2GB+ RAM, 64-bit OS, 16GB+ SD card (or USB SSD)
+​
+What you need
+Raspberry Pi 4 or 5 (2GB+ recommended)
+MicroSD card (16GB+) or USB SSD (better performance)
+Power supply (official Pi PSU recommended)
+Network connection (Ethernet or WiFi)
+~30 minutes
+​
+1) Flash the OS
+Use Raspberry Pi OS Lite (64-bit) — no desktop needed for a headless server.
+Download Raspberry Pi Imager
+Choose OS: Raspberry Pi OS Lite (64-bit)
+Click the gear icon (⚙️) to pre-configure:
+Set hostname: gateway-host
+Enable SSH
+Set username/password
+Configure WiFi (if not using Ethernet)
+Flash to your SD card / USB drive
+Insert and boot the Pi
+​
+2) Connect via SSH
+ssh user@gateway-host
+# or use the IP address
+ssh user@192.168.x.x
+​
+3) System Setup
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install essential packages
+sudo apt install -y git curl build-essential
+
+# Set timezone (important for cron/reminders)
+sudo timedatectl set-timezone America/Chicago  # Change to your timezone
+​
+4) Install Node.js 24 (ARM64)
+# Install Node.js via NodeSource
+curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# Verify
+node --version  # Should show v24.x.x
+npm --version
+​
+5) Add Swap (Important for 2GB or less)
+Swap prevents out-of-memory crashes:
+# Create 2GB swap file
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# Make permanent
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# Optimize for low RAM (reduce swappiness)
+echo 'vm.swappiness=10' | sudo tee -a /etc/sysctl.conf
+sudo sysctl -p
+​
+6) Install OpenClaw
+​
+Option A: Standard Install (Recommended)
+curl -fsSL https://openclaw.ai/install.sh | bash
+​
+Option B: Hackable Install (For tinkering)
+git clone https://github.com/openclaw/openclaw.git
+cd openclaw
+npm install
+npm run build
+npm link
+The hackable install gives you direct access to logs and code — useful for debugging ARM-specific issues.
+​
+7) Run Onboarding
+openclaw onboard --install-daemon
+Follow the wizard:
+Gateway mode: Local
+Auth: API keys recommended (OAuth can be finicky on headless Pi)
+Channels: Telegram is easiest to start with
+Daemon: Yes (systemd)
+​
+8) Verify Installation
+# Check status
+openclaw status
+
+# Check service
+sudo systemctl status openclaw
+
+# View logs
+journalctl -u openclaw -f
+​
+9) Access the OpenClaw Dashboard
+Replace user@gateway-host with your Pi username and hostname or IP address.
+On your computer, ask the Pi to print a fresh dashboard URL:
+ssh user@gateway-host 'openclaw dashboard --no-open'
+The command prints Dashboard URL:. Depending on how gateway.auth.token is configured, the URL may be a plain http://127.0.0.1:18789/ link or one that includes #token=....
+In another terminal on your computer, create the SSH tunnel:
+ssh -N -L 18789:127.0.0.1:18789 user@gateway-host
+Then open the printed Dashboard URL in your local browser.
+If the UI asks for auth, paste the token from gateway.auth.token (or OPENCLAW_GATEWAY_TOKEN) into Control UI settings.
+For always-on remote access, see Tailscale.
+​
+Performance Optimizations
+​
+Use a USB SSD (Huge Improvement)
+SD cards are slow and wear out. A USB SSD dramatically improves performance:
+# Check if booting from USB
+lsblk
+See Pi USB boot guide for setup.
+​
+Speed up CLI startup (module compile cache)
+On lower-power Pi hosts, enable Node’s module compile cache so repeated CLI runs are faster:
+grep -q 'NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache' ~/.bashrc || cat >> ~/.bashrc <<'EOF' # pragma: allowlist secret
+export NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
+mkdir -p /var/tmp/openclaw-compile-cache
+export OPENCLAW_NO_RESPAWN=1
+EOF
+source ~/.bashrc
+Notes:
+NODE_COMPILE_CACHE speeds up subsequent runs (status, health, --help).
+/var/tmp survives reboots better than /tmp.
+OPENCLAW_NO_RESPAWN=1 avoids extra startup cost from CLI self-respawn.
+First run warms the cache; later runs benefit most.
+​
+systemd startup tuning (optional)
+If this Pi is mostly running OpenClaw, add a service drop-in to reduce restart jitter and keep startup env stable:
+sudo systemctl edit openclaw
+[Service]
+Environment=OPENCLAW_NO_RESPAWN=1
+Environment=NODE_COMPILE_CACHE=/var/tmp/openclaw-compile-cache
+Restart=always
+RestartSec=2
+TimeoutStartSec=90
+Then apply:
+sudo systemctl daemon-reload
+sudo systemctl restart openclaw
+If possible, keep OpenClaw state/cache on SSD-backed storage to avoid SD-card random-I/O bottlenecks during cold starts.
+How Restart= policies help automated recovery: systemd can automate service recovery.
+​
+Reduce Memory Usage
+# Disable GPU memory allocation (headless)
+echo 'gpu_mem=16' | sudo tee -a /boot/config.txt
+
+# Disable Bluetooth if not needed
+sudo systemctl disable bluetooth
+​
+Monitor Resources
+# Check memory
+free -h
+
+# Check CPU temperature
+vcgencmd measure_temp
+
+# Live monitoring
+htop
+​
+ARM-Specific Notes
+​
+Binary Compatibility
+Most OpenClaw features work on ARM64, but some external binaries may need ARM builds:
+Tool	ARM64 Status	Notes
+Node.js	✅	Works great
+WhatsApp (Baileys)	✅	Pure JS, no issues
+Telegram	✅	Pure JS, no issues
+gog (Gmail CLI)	⚠️	Check for ARM release
+Chromium (browser)	✅	sudo apt install chromium-browser
+If a skill fails, check if its binary has an ARM build. Many Go/Rust tools do; some don’t.
+​
+32-bit vs 64-bit
+Always use 64-bit OS. Node.js and many modern tools require it. Check with:
+uname -m
+# Should show: aarch64 (64-bit) not armv7l (32-bit)
+​
+Recommended Model Setup
+Since the Pi is just the Gateway (models run in the cloud), use API-based models:
+{
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "anthropic/claude-sonnet-4-20250514",
+        "fallbacks": ["openai/gpt-4o-mini"]
+      }
+    }
+  }
+}
+Don’t try to run local LLMs on a Pi — even small models are too slow. Let Claude/GPT do the heavy lifting.
+​
+Auto-Start on Boot
+Onboarding sets this up, but to verify:
+# Check service is enabled
+sudo systemctl is-enabled openclaw
+
+# Enable if not
+sudo systemctl enable openclaw
+
+# Start on boot
+sudo systemctl start openclaw
+​
+Troubleshooting
+​
+Out of Memory (OOM)
+# Check memory
+free -h
+
+# Add more swap (see Step 5)
+# Or reduce services running on the Pi
+​
+Slow Performance
+Use USB SSD instead of SD card
+Disable unused services: sudo systemctl disable cups bluetooth avahi-daemon
+Check CPU throttling: vcgencmd get_throttled (should return 0x0)
+​
+Service will not start
+# Check logs
+journalctl -u openclaw --no-pager -n 100
+
+# Common fix: rebuild
+cd ~/openclaw  # if using hackable install
+npm run build
+sudo systemctl restart openclaw
+​
+ARM Binary Issues
+If a skill fails with “exec format error”:
+Check if the binary has an ARM64 build
+Try building from source
+Or use a Docker container with ARM support
+​
+WiFi Drops
+For headless Pis on WiFi:
+# Disable WiFi power management
+sudo iwconfig wlan0 power off
+
+# Make permanent
+echo 'wireless-power off' | sudo tee -a /etc/network/interfaces
+​
+Cost Comparison
+Setup	One-Time Cost	Monthly Cost	Notes
+Pi 4 (2GB)	~$45	$0	+ power (~$5/yr)
+Pi 4 (4GB)	~$55	$0	Recommended
+Pi 5 (4GB)	~$60	$0	Best performance
+Pi 5 (8GB)	~$80	$0	Overkill but future-proof
+DigitalOcean	$0	$6/mo	$72/year
+Hetzner	$0	€3.79/mo	~$50/year
+Break-even: A Pi pays for itself in ~6-12 months vs cloud VPS.
+​
+See Also
+Linux guide — general Linux setup
+DigitalOcean guide — cloud alternative
+Hetzner guide — Docker setup
+Tailscale — remote access
+Nodes — pair your laptop/phone with the Pi gateway
+
+
+
+Platforms overview
+Oracle Cloud
+​
+Goal
+Run a persistent OpenClaw Gateway on Oracle Cloud’s Always Free ARM tier.
+Oracle’s free tier can be a great fit for OpenClaw (especially if you already have an OCI account), but it comes with tradeoffs:
+ARM architecture (most things work, but some binaries may be x86-only)
+Capacity and signup can be finicky
+​
+Cost Comparison (2026)
+Provider	Plan	Specs	Price/mo	Notes
+Oracle Cloud	Always Free ARM	up to 4 OCPU, 24GB RAM	$0	ARM, limited capacity
+Hetzner	CX22	2 vCPU, 4GB RAM	~ $4	Cheapest paid option
+DigitalOcean	Basic	1 vCPU, 1GB RAM	$6	Easy UI, good docs
+Vultr	Cloud Compute	1 vCPU, 1GB RAM	$6	Many locations
+Linode	Nanode	1 vCPU, 1GB RAM	$5	Now part of Akamai
+​
+Prerequisites
+Oracle Cloud account (signup) — see community signup guide if you hit issues
+Tailscale account (free at tailscale.com)
+~30 minutes
+​
+1) Create an OCI Instance
+Log into Oracle Cloud Console
+Navigate to Compute → Instances → Create Instance
+Configure:
+Name: openclaw
+Image: Ubuntu 24.04 (aarch64)
+Shape: VM.Standard.A1.Flex (Ampere ARM)
+OCPUs: 2 (or up to 4)
+Memory: 12 GB (or up to 24 GB)
+Boot volume: 50 GB (up to 200 GB free)
+SSH key: Add your public key
+Click Create
+Note the public IP address
+Tip: If instance creation fails with “Out of capacity”, try a different availability domain or retry later. Free tier capacity is limited.
+​
+2) Connect and Update
+# Connect via public IP
+ssh ubuntu@YOUR_PUBLIC_IP
+
+# Update system
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y build-essential
+Note: build-essential is required for ARM compilation of some dependencies.
+​
+3) Configure User and Hostname
+# Set hostname
+sudo hostnamectl set-hostname openclaw
+
+# Set password for ubuntu user
+sudo passwd ubuntu
+
+# Enable lingering (keeps user services running after logout)
+sudo loginctl enable-linger ubuntu
+​
+4) Install Tailscale
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up --ssh --hostname=openclaw
+This enables Tailscale SSH, so you can connect via ssh openclaw from any device on your tailnet — no public IP needed.
+Verify:
+tailscale status
+From now on, connect via Tailscale: ssh ubuntu@openclaw (or use the Tailscale IP).
+​
+5) Install OpenClaw
+curl -fsSL https://openclaw.ai/install.sh | bash
+source ~/.bashrc
+When prompted “How do you want to hatch your bot?”, select “Do this later”.
+Note: If you hit ARM-native build issues, start with system packages (e.g. sudo apt install -y build-essential) before reaching for Homebrew.
+​
+6) Configure Gateway (loopback + token auth) and enable Tailscale Serve
+Use token auth as the default. It’s predictable and avoids needing any “insecure auth” Control UI flags.
+# Keep the Gateway private on the VM
+openclaw config set gateway.bind loopback
+
+# Require auth for the Gateway + Control UI
+openclaw config set gateway.auth.mode token
+openclaw doctor --generate-gateway-token
+
+# Expose over Tailscale Serve (HTTPS + tailnet access)
+openclaw config set gateway.tailscale.mode serve
+openclaw config set gateway.trustedProxies '["127.0.0.1"]'
+
+systemctl --user restart openclaw-gateway
+​
+7) Verify
+# Check version
+openclaw --version
+
+# Check daemon status
+systemctl --user status openclaw-gateway
+
+# Check Tailscale Serve
+tailscale serve status
+
+# Test local response
+curl http://localhost:18789
+​
+8) Lock Down VCN Security
+Now that everything is working, lock down the VCN to block all traffic except Tailscale. OCI’s Virtual Cloud Network acts as a firewall at the network edge — traffic is blocked before it reaches your instance.
+Go to Networking → Virtual Cloud Networks in the OCI Console
+Click your VCN → Security Lists → Default Security List
+Remove all ingress rules except:
+0.0.0.0/0 UDP 41641 (Tailscale)
+Keep default egress rules (allow all outbound)
+This blocks SSH on port 22, HTTP, HTTPS, and everything else at the network edge. From now on, you can only connect via Tailscale.
+​
+Access the Control UI
+From any device on your Tailscale network:
+https://openclaw.<tailnet-name>.ts.net/
+Replace <tailnet-name> with your tailnet name (visible in tailscale status).
+No SSH tunnel needed. Tailscale provides:
+HTTPS encryption (automatic certs)
+Authentication via Tailscale identity
+Access from any device on your tailnet (laptop, phone, etc.)
+​
+Security: VCN + Tailscale (recommended baseline)
+With the VCN locked down (only UDP 41641 open) and the Gateway bound to loopback, you get strong defense-in-depth: public traffic is blocked at the network edge, and admin access happens over your tailnet.
+This setup often removes the need for extra host-based firewall rules purely to stop Internet-wide SSH brute force — but you should still keep the OS updated, run openclaw security audit, and verify you aren’t accidentally listening on public interfaces.
+​
+Already protected
+Traditional Step	Needed?	Why
+UFW firewall	No	VCN blocks before traffic reaches instance
+fail2ban	No	No brute force if port 22 blocked at VCN
+sshd hardening	No	Tailscale SSH doesn’t use sshd
+Disable root login	No	Tailscale uses Tailscale identity, not system users
+SSH key-only auth	No	Tailscale authenticates via your tailnet
+IPv6 hardening	Usually not	Depends on your VCN/subnet settings; verify what’s actually assigned/exposed
+​
+Still Recommended
+Credential permissions: chmod 700 ~/.openclaw
+Security audit: openclaw security audit
+System updates: sudo apt update && sudo apt upgrade regularly
+Monitor Tailscale: Review devices in Tailscale admin console
+​
+Verify Security Posture
+# Confirm no public ports listening
+sudo ss -tlnp | grep -v '127.0.0.1\|::1'
+
+# Verify Tailscale SSH is active
+tailscale status | grep -q 'offers: ssh' && echo "Tailscale SSH active"
+
+# Optional: disable sshd entirely
+sudo systemctl disable --now ssh
+​
+Fallback: SSH Tunnel
+If Tailscale Serve isn’t working, use an SSH tunnel:
+# From your local machine (via Tailscale)
+ssh -L 18789:127.0.0.1:18789 ubuntu@openclaw
+Then open http://localhost:18789.
+​
+Troubleshooting
+​
+Instance creation fails (“Out of capacity”)
+Free tier ARM instances are popular. Try:
+Different availability domain
+Retry during off-peak hours (early morning)
+Use the “Always Free” filter when selecting shape
+​
+Tailscale will not connect
+# Check status
+sudo tailscale status
+
+# Re-authenticate
+sudo tailscale up --ssh --hostname=openclaw --reset
+​
+Gateway will not start
+openclaw gateway status
+openclaw doctor --non-interactive
+journalctl --user -u openclaw-gateway -n 50
+​
+Cannot reach Control UI
+# Verify Tailscale Serve is running
+tailscale serve status
+
+# Check gateway is listening
+curl http://localhost:18789
+
+# Restart if needed
+systemctl --user restart openclaw-gateway
+​
+ARM binary issues
+Some tools may not have ARM builds. Check:
+uname -m  # Should show aarch64
+Most npm packages work fine. For binaries, look for linux-arm64 or aarch64 releases.
+​
+Persistence
+All state lives in:
+~/.openclaw/ — config, credentials, session data
+~/.openclaw/workspace/ — workspace (SOUL.md, memory, artifacts)
+Back up periodically:
+tar -czvf openclaw-backup.tar.gz ~/.openclaw ~/.openclaw/workspace
+​
+See Also
+Gateway remote access — other remote access patterns
+Tailscale integration — full Tailscale docs
+Gateway configuration — all config options
+DigitalOcean guide — if you want paid + easier signup
+Hetzner guide — Docker-based alternative
+
+
+
+Platforms overview
+DigitalOcean
+​
+Goal
+Run a persistent OpenClaw Gateway on DigitalOcean for **
+6
+/
+m
+o
+n
+t
+h
+∗
+∗
+(
+o
+r
+6/month∗∗(or4/mo with reserved pricing).
+If you want a $0/month option and don’t mind ARM + provider-specific setup, see the Oracle Cloud guide.
+​
+Cost Comparison (2026)
+Provider	Plan	Specs	Price/mo	Notes
+Oracle Cloud	Always Free ARM	up to 4 OCPU, 24GB RAM	$0	ARM, limited capacity / signup quirks
+Hetzner	CX22	2 vCPU, 4GB RAM	€3.79 (~$4)	Cheapest paid option
+DigitalOcean	Basic	1 vCPU, 1GB RAM	$6	Easy UI, good docs
+Vultr	Cloud Compute	1 vCPU, 1GB RAM	$6	Many locations
+Linode	Nanode	1 vCPU, 1GB RAM	$5	Now part of Akamai
+Picking a provider:
+DigitalOcean: simplest UX + predictable setup (this guide)
+Hetzner: good price/perf (see Hetzner guide)
+Oracle Cloud: can be $0/month, but is more finicky and ARM-only (see Oracle guide)
+​
+Prerequisites
+DigitalOcean account (signup with $200 free credit)
+SSH key pair (or willingness to use password auth)
+~20 minutes
+​
+1) Create a Droplet
+Use a clean base image (Ubuntu 24.04 LTS). Avoid third-party Marketplace 1-click images unless you have reviewed their startup scripts and firewall defaults.
+Log into DigitalOcean
+Click Create → Droplets
+Choose:
+Region: Closest to you (or your users)
+Image: Ubuntu 24.04 LTS
+Size: Basic → Regular → $6/mo (1 vCPU, 1GB RAM, 25GB SSD)
+Authentication: SSH key (recommended) or password
+Click Create Droplet
+Note the IP address
+​
+2) Connect via SSH
+ssh root@YOUR_DROPLET_IP
+​
+3) Install OpenClaw
+# Update system
+apt update && apt upgrade -y
+
+# Install Node.js 24
+curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
+apt install -y nodejs
+
+# Install OpenClaw
+curl -fsSL https://openclaw.ai/install.sh | bash
+
+# Verify
+openclaw --version
+​
+4) Run Onboarding
+openclaw onboard --install-daemon
+The wizard will walk you through:
+Model auth (API keys or OAuth)
+Channel setup (Telegram, WhatsApp, Discord, etc.)
+Gateway token (auto-generated)
+Daemon installation (systemd)
+​
+5) Verify the Gateway
+# Check status
+openclaw status
+
+# Check service
+systemctl --user status openclaw-gateway.service
+
+# View logs
+journalctl --user -u openclaw-gateway.service -f
+​
+6) Access the Dashboard
+The gateway binds to loopback by default. To access the Control UI:
+Option A: SSH Tunnel (recommended)
+# From your local machine
+ssh -L 18789:localhost:18789 root@YOUR_DROPLET_IP
+
+# Then open: http://localhost:18789
+Option B: Tailscale Serve (HTTPS, loopback-only)
+# On the droplet
+curl -fsSL https://tailscale.com/install.sh | sh
+tailscale up
+
+# Configure Gateway to use Tailscale Serve
+openclaw config set gateway.tailscale.mode serve
+openclaw gateway restart
+Open: https://<magicdns>/
+Notes:
+Serve keeps the Gateway loopback-only and authenticates Control UI/WebSocket traffic via Tailscale identity headers (tokenless auth assumes trusted gateway host; HTTP APIs still require token/password).
+To require token/password instead, set gateway.auth.allowTailscale: false or use gateway.auth.mode: "password".
+Option C: Tailnet bind (no Serve)
+openclaw config set gateway.bind tailnet
+openclaw gateway restart
+Open: http://<tailscale-ip>:18789 (token required).
+​
+7) Connect Your Channels
+​
+Telegram
+openclaw pairing list telegram
+openclaw pairing approve telegram <CODE>
+​
+WhatsApp
+openclaw channels login whatsapp
+# Scan QR code
+See Channels for other providers.
+​
+Optimizations for 1GB RAM
+The $6 droplet only has 1GB RAM. To keep things running smoothly:
+​
+Add swap (recommended)
+fallocate -l 2G /swapfile
+chmod 600 /swapfile
+mkswap /swapfile
+swapon /swapfile
+echo '/swapfile none swap sw 0 0' >> /etc/fstab
+​
+Use a lighter model
+If you’re hitting OOMs, consider:
+Using API-based models (Claude, GPT) instead of local models
+Setting agents.defaults.model.primary to a smaller model
+​
+Monitor memory
+free -h
+htop
+​
+Persistence
+All state lives in:
+~/.openclaw/ — config, credentials, session data
+~/.openclaw/workspace/ — workspace (SOUL.md, memory, etc.)
+These survive reboots. Back them up periodically:
+tar -czvf openclaw-backup.tar.gz ~/.openclaw ~/.openclaw/workspace
+​
+Oracle Cloud Free Alternative
+Oracle Cloud offers Always Free ARM instances that are significantly more powerful than any paid option here — for $0/month.
+What you get	Specs
+4 OCPUs	ARM Ampere A1
+24GB RAM	More than enough
+200GB storage	Block volume
+Forever free	No credit card charges
+Caveats:
+Signup can be finicky (retry if it fails)
+ARM architecture — most things work, but some binaries need ARM builds
+For the full setup guide, see Oracle Cloud. For signup tips and troubleshooting the enrollment process, see this community guide.
+​
+Troubleshooting
+​
+Gateway will not start
+openclaw gateway status
+openclaw doctor --non-interactive
+journalctl -u openclaw --no-pager -n 50
+​
+Port already in use
+lsof -i :18789
+kill <PID>
+​
+Out of memory
+# Check memory
+free -h
+
+# Add more swap
+# Or upgrade to $12/mo droplet (2GB RAM)
+​
+See Also
+Hetzner guide — cheaper, more powerful
+Docker install — containerized setup
+Tailscale — secure remote access
+Configuration — full config reference

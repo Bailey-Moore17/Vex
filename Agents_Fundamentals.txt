@@ -1,0 +1,1299 @@
+Fundamentals
+Pi Integration Architecture
+This document describes how OpenClaw integrates with pi-coding-agent and its sibling packages (pi-ai, pi-agent-core, pi-tui) to power its AI agent capabilities.
+​
+Overview
+OpenClaw uses the pi SDK to embed an AI coding agent into its messaging gateway architecture. Instead of spawning pi as a subprocess or using RPC mode, OpenClaw directly imports and instantiates pi’s AgentSession via createAgentSession(). This embedded approach provides:
+Full control over session lifecycle and event handling
+Custom tool injection (messaging, sandbox, channel-specific actions)
+System prompt customization per channel/context
+Session persistence with branching/compaction support
+Multi-account auth profile rotation with failover
+Provider-agnostic model switching
+​
+Package Dependencies
+{
+  "@mariozechner/pi-agent-core": "0.49.3",
+  "@mariozechner/pi-ai": "0.49.3",
+  "@mariozechner/pi-coding-agent": "0.49.3",
+  "@mariozechner/pi-tui": "0.49.3"
+}
+Package	Purpose
+pi-ai	Core LLM abstractions: Model, streamSimple, message types, provider APIs
+pi-agent-core	Agent loop, tool execution, AgentMessage types
+pi-coding-agent	High-level SDK: createAgentSession, SessionManager, AuthStorage, ModelRegistry, built-in tools
+pi-tui	Terminal UI components (used in OpenClaw’s local TUI mode)
+​
+File Structure
+src/agents/
+├── pi-embedded-runner.ts          # Re-exports from pi-embedded-runner/
+├── pi-embedded-runner/
+│   ├── run.ts                     # Main entry: runEmbeddedPiAgent()
+│   ├── run/
+│   │   ├── attempt.ts             # Single attempt logic with session setup
+│   │   ├── params.ts              # RunEmbeddedPiAgentParams type
+│   │   ├── payloads.ts            # Build response payloads from run results
+│   │   ├── images.ts              # Vision model image injection
+│   │   └── types.ts               # EmbeddedRunAttemptResult
+│   ├── abort.ts                   # Abort error detection
+│   ├── cache-ttl.ts               # Cache TTL tracking for context pruning
+│   ├── compact.ts                 # Manual/auto compaction logic
+│   ├── extensions.ts              # Load pi extensions for embedded runs
+│   ├── extra-params.ts            # Provider-specific stream params
+│   ├── google.ts                  # Google/Gemini turn ordering fixes
+│   ├── history.ts                 # History limiting (DM vs group)
+│   ├── lanes.ts                   # Session/global command lanes
+│   ├── logger.ts                  # Subsystem logger
+│   ├── model.ts                   # Model resolution via ModelRegistry
+│   ├── runs.ts                    # Active run tracking, abort, queue
+│   ├── sandbox-info.ts            # Sandbox info for system prompt
+│   ├── session-manager-cache.ts   # SessionManager instance caching
+│   ├── session-manager-init.ts    # Session file initialization
+│   ├── system-prompt.ts           # System prompt builder
+│   ├── tool-split.ts              # Split tools into builtIn vs custom
+│   ├── types.ts                   # EmbeddedPiAgentMeta, EmbeddedPiRunResult
+│   └── utils.ts                   # ThinkLevel mapping, error description
+├── pi-embedded-subscribe.ts       # Session event subscription/dispatch
+├── pi-embedded-subscribe.types.ts # SubscribeEmbeddedPiSessionParams
+├── pi-embedded-subscribe.handlers.ts # Event handler factory
+├── pi-embedded-subscribe.handlers.lifecycle.ts
+├── pi-embedded-subscribe.handlers.types.ts
+├── pi-embedded-block-chunker.ts   # Streaming block reply chunking
+├── pi-embedded-messaging.ts       # Messaging tool sent tracking
+├── pi-embedded-helpers.ts         # Error classification, turn validation
+├── pi-embedded-helpers/           # Helper modules
+├── pi-embedded-utils.ts           # Formatting utilities
+├── pi-tools.ts                    # createOpenClawCodingTools()
+├── pi-tools.abort.ts              # AbortSignal wrapping for tools
+├── pi-tools.policy.ts             # Tool allowlist/denylist policy
+├── pi-tools.read.ts               # Read tool customizations
+├── pi-tools.schema.ts             # Tool schema normalization
+├── pi-tools.types.ts              # AnyAgentTool type alias
+├── pi-tool-definition-adapter.ts  # AgentTool -> ToolDefinition adapter
+├── pi-settings.ts                 # Settings overrides
+├── pi-extensions/                 # Custom pi extensions
+│   ├── compaction-safeguard.ts    # Safeguard extension
+│   ├── compaction-safeguard-runtime.ts
+│   ├── context-pruning.ts         # Cache-TTL context pruning extension
+│   └── context-pruning/
+├── model-auth.ts                  # Auth profile resolution
+├── auth-profiles.ts               # Profile store, cooldown, failover
+├── model-selection.ts             # Default model resolution
+├── models-config.ts               # models.json generation
+├── model-catalog.ts               # Model catalog cache
+├── context-window-guard.ts        # Context window validation
+├── failover-error.ts              # FailoverError class
+├── defaults.ts                    # DEFAULT_PROVIDER, DEFAULT_MODEL
+├── system-prompt.ts               # buildAgentSystemPrompt()
+├── system-prompt-params.ts        # System prompt parameter resolution
+├── system-prompt-report.ts        # Debug report generation
+├── tool-summaries.ts              # Tool description summaries
+├── tool-policy.ts                 # Tool policy resolution
+├── transcript-policy.ts           # Transcript validation policy
+├── skills.ts                      # Skill snapshot/prompt building
+├── skills/                        # Skill subsystem
+├── sandbox.ts                     # Sandbox context resolution
+├── sandbox/                       # Sandbox subsystem
+├── channel-tools.ts               # Channel-specific tool injection
+├── openclaw-tools.ts              # OpenClaw-specific tools
+├── bash-tools.ts                  # exec/process tools
+├── apply-patch.ts                 # apply_patch tool (OpenAI)
+├── tools/                         # Individual tool implementations
+│   ├── browser-tool.ts
+│   ├── canvas-tool.ts
+│   ├── cron-tool.ts
+│   ├── gateway-tool.ts
+│   ├── image-tool.ts
+│   ├── message-tool.ts
+│   ├── nodes-tool.ts
+│   ├── session*.ts
+│   ├── web-*.ts
+│   └── ...
+└── ...
+Channel-specific message action runtimes now live in the plugin-owned extension directories instead of under src/agents/tools, for example:
+extensions/discord/src/actions/runtime*.ts
+extensions/slack/src/action-runtime.ts
+extensions/telegram/src/action-runtime.ts
+extensions/whatsapp/src/action-runtime.ts
+​
+Core Integration Flow
+​
+1. Running an Embedded Agent
+The main entry point is runEmbeddedPiAgent() in pi-embedded-runner/run.ts:
+import { runEmbeddedPiAgent } from "./agents/pi-embedded-runner.js";
+
+const result = await runEmbeddedPiAgent({
+  sessionId: "user-123",
+  sessionKey: "main:whatsapp:+1234567890",
+  sessionFile: "/path/to/session.jsonl",
+  workspaceDir: "/path/to/workspace",
+  config: openclawConfig,
+  prompt: "Hello, how are you?",
+  provider: "anthropic",
+  model: "claude-sonnet-4-20250514",
+  timeoutMs: 120_000,
+  runId: "run-abc",
+  onBlockReply: async (payload) => {
+    await sendToChannel(payload.text, payload.mediaUrls);
+  },
+});
+​
+2. Session Creation
+Inside runEmbeddedAttempt() (called by runEmbeddedPiAgent()), the pi SDK is used:
+import {
+  createAgentSession,
+  DefaultResourceLoader,
+  SessionManager,
+  SettingsManager,
+} from "@mariozechner/pi-coding-agent";
+
+const resourceLoader = new DefaultResourceLoader({
+  cwd: resolvedWorkspace,
+  agentDir,
+  settingsManager,
+  additionalExtensionPaths,
+});
+await resourceLoader.reload();
+
+const { session } = await createAgentSession({
+  cwd: resolvedWorkspace,
+  agentDir,
+  authStorage: params.authStorage,
+  modelRegistry: params.modelRegistry,
+  model: params.model,
+  thinkingLevel: mapThinkingLevel(params.thinkLevel),
+  tools: builtInTools,
+  customTools: allCustomTools,
+  sessionManager,
+  settingsManager,
+  resourceLoader,
+});
+
+applySystemPromptOverrideToSession(session, systemPromptOverride);
+​
+3. Event Subscription
+subscribeEmbeddedPiSession() subscribes to pi’s AgentSession events:
+const subscription = subscribeEmbeddedPiSession({
+  session: activeSession,
+  runId: params.runId,
+  verboseLevel: params.verboseLevel,
+  reasoningMode: params.reasoningLevel,
+  toolResultFormat: params.toolResultFormat,
+  onToolResult: params.onToolResult,
+  onReasoningStream: params.onReasoningStream,
+  onBlockReply: params.onBlockReply,
+  onPartialReply: params.onPartialReply,
+  onAgentEvent: params.onAgentEvent,
+});
+Events handled include:
+message_start / message_end / message_update (streaming text/thinking)
+tool_execution_start / tool_execution_update / tool_execution_end
+turn_start / turn_end
+agent_start / agent_end
+auto_compaction_start / auto_compaction_end
+​
+4. Prompting
+After setup, the session is prompted:
+await session.prompt(effectivePrompt, { images: imageResult.images });
+The SDK handles the full agent loop: sending to LLM, executing tool calls, streaming responses.
+Image injection is prompt-local: OpenClaw loads image refs from the current prompt and passes them via images for that turn only. It does not re-scan older history turns to re-inject image payloads.
+​
+Tool Architecture
+​
+Tool Pipeline
+Base Tools: pi’s codingTools (read, bash, edit, write)
+Custom Replacements: OpenClaw replaces bash with exec/process, customizes read/edit/write for sandbox
+OpenClaw Tools: messaging, browser, canvas, sessions, cron, gateway, etc.
+Channel Tools: Discord/Telegram/Slack/WhatsApp-specific action tools
+Policy Filtering: Tools filtered by profile, provider, agent, group, sandbox policies
+Schema Normalization: Schemas cleaned for Gemini/OpenAI quirks
+AbortSignal Wrapping: Tools wrapped to respect abort signals
+​
+Tool Definition Adapter
+pi-agent-core’s AgentTool has a different execute signature than pi-coding-agent’s ToolDefinition. The adapter in pi-tool-definition-adapter.ts bridges this:
+export function toToolDefinitions(tools: AnyAgentTool[]): ToolDefinition[] {
+  return tools.map((tool) => ({
+    name: tool.name,
+    label: tool.label ?? name,
+    description: tool.description ?? "",
+    parameters: tool.parameters,
+    execute: async (toolCallId, params, onUpdate, _ctx, signal) => {
+      // pi-coding-agent signature differs from pi-agent-core
+      return await tool.execute(toolCallId, params, signal, onUpdate);
+    },
+  }));
+}
+​
+Tool Split Strategy
+splitSdkTools() passes all tools via customTools:
+export function splitSdkTools(options: { tools: AnyAgentTool[]; sandboxEnabled: boolean }) {
+  return {
+    builtInTools: [], // Empty. We override everything
+    customTools: toToolDefinitions(options.tools),
+  };
+}
+This ensures OpenClaw’s policy filtering, sandbox integration, and extended toolset remain consistent across providers.
+​
+System Prompt Construction
+The system prompt is built in buildAgentSystemPrompt() (system-prompt.ts). It assembles a full prompt with sections including Tooling, Tool Call Style, Safety guardrails, OpenClaw CLI reference, Skills, Docs, Workspace, Sandbox, Messaging, Reply Tags, Voice, Silent Replies, Heartbeats, Runtime metadata, plus Memory and Reactions when enabled, and optional context files and extra system prompt content. Sections are trimmed for minimal prompt mode used by subagents.
+The prompt is applied after session creation via applySystemPromptOverrideToSession():
+const systemPromptOverride = createSystemPromptOverride(appendPrompt);
+applySystemPromptOverrideToSession(session, systemPromptOverride);
+​
+Session Management
+​
+Session Files
+Sessions are JSONL files with tree structure (id/parentId linking). Pi’s SessionManager handles persistence:
+const sessionManager = SessionManager.open(params.sessionFile);
+OpenClaw wraps this with guardSessionManager() for tool result safety.
+​
+Session Caching
+session-manager-cache.ts caches SessionManager instances to avoid repeated file parsing:
+await prewarmSessionFile(params.sessionFile);
+sessionManager = SessionManager.open(params.sessionFile);
+trackSessionManagerAccess(params.sessionFile);
+​
+History Limiting
+limitHistoryTurns() trims conversation history based on channel type (DM vs group).
+​
+Compaction
+Auto-compaction triggers on context overflow. compactEmbeddedPiSessionDirect() handles manual compaction:
+const compactResult = await compactEmbeddedPiSessionDirect({
+  sessionId, sessionFile, provider, model, ...
+});
+​
+Authentication & Model Resolution
+​
+Auth Profiles
+OpenClaw maintains an auth profile store with multiple API keys per provider:
+const authStore = ensureAuthProfileStore(agentDir, { allowKeychainPrompt: false });
+const profileOrder = resolveAuthProfileOrder({ cfg, store: authStore, provider, preferredProfile });
+Profiles rotate on failures with cooldown tracking:
+await markAuthProfileFailure({ store, profileId, reason, cfg, agentDir });
+const rotated = await advanceAuthProfile();
+​
+Model Resolution
+import { resolveModel } from "./pi-embedded-runner/model.js";
+
+const { model, error, authStorage, modelRegistry } = resolveModel(
+  provider,
+  modelId,
+  agentDir,
+  config,
+);
+
+// Uses pi's ModelRegistry and AuthStorage
+authStorage.setRuntimeApiKey(model.provider, apiKeyInfo.apiKey);
+​
+Failover
+FailoverError triggers model fallback when configured:
+if (fallbackConfigured && isFailoverErrorMessage(errorText)) {
+  throw new FailoverError(errorText, {
+    reason: promptFailoverReason ?? "unknown",
+    provider,
+    model: modelId,
+    profileId,
+    status: resolveFailoverStatus(promptFailoverReason),
+  });
+}
+​
+Pi Extensions
+OpenClaw loads custom pi extensions for specialized behavior:
+​
+Compaction Safeguard
+src/agents/pi-extensions/compaction-safeguard.ts adds guardrails to compaction, including adaptive token budgeting plus tool failure and file operation summaries:
+if (resolveCompactionMode(params.cfg) === "safeguard") {
+  setCompactionSafeguardRuntime(params.sessionManager, { maxHistoryShare });
+  paths.push(resolvePiExtensionPath("compaction-safeguard"));
+}
+​
+Context Pruning
+src/agents/pi-extensions/context-pruning.ts implements cache-TTL based context pruning:
+if (cfg?.agents?.defaults?.contextPruning?.mode === "cache-ttl") {
+  setContextPruningRuntime(params.sessionManager, {
+    settings,
+    contextWindowTokens,
+    isToolPrunable,
+    lastCacheTouchAt,
+  });
+  paths.push(resolvePiExtensionPath("context-pruning"));
+}
+​
+Streaming & Block Replies
+​
+Block Chunking
+EmbeddedBlockChunker manages streaming text into discrete reply blocks:
+const blockChunker = blockChunking ? new EmbeddedBlockChunker(blockChunking) : null;
+​
+Thinking/Final Tag Stripping
+Streaming output is processed to strip <think>/<thinking> blocks and extract <final> content:
+const stripBlockTags = (text: string, state: { thinking: boolean; final: boolean }) => {
+  // Strip <think>...</think> content
+  // If enforceFinalTag, only return <final>...</final> content
+};
+​
+Reply Directives
+Reply directives like [[media:url]], [[voice]], [[reply:id]] are parsed and extracted:
+const { text: cleanedText, mediaUrls, audioAsVoice, replyToId } = consumeReplyDirectives(chunk);
+​
+Error Handling
+​
+Error Classification
+pi-embedded-helpers.ts classifies errors for appropriate handling:
+isContextOverflowError(errorText)     // Context too large
+isCompactionFailureError(errorText)   // Compaction failed
+isAuthAssistantError(lastAssistant)   // Auth failure
+isRateLimitAssistantError(...)        // Rate limited
+isFailoverAssistantError(...)         // Should failover
+classifyFailoverReason(errorText)     // "auth" | "rate_limit" | "quota" | "timeout" | ...
+​
+Thinking Level Fallback
+If a thinking level is unsupported, it falls back:
+const fallbackThinking = pickFallbackThinkingLevel({
+  message: errorText,
+  attempted: attemptedThinking,
+});
+if (fallbackThinking) {
+  thinkLevel = fallbackThinking;
+  continue;
+}
+​
+Sandbox Integration
+When sandbox mode is enabled, tools and paths are constrained:
+const sandbox = await resolveSandboxContext({
+  config: params.config,
+  sessionKey: sandboxSessionKey,
+  workspaceDir: resolvedWorkspace,
+});
+
+if (sandboxRoot) {
+  // Use sandboxed read/edit/write tools
+  // Exec runs in container
+  // Browser uses bridge URL
+}
+​
+Provider-Specific Handling
+​
+Anthropic
+Refusal magic string scrubbing
+Turn validation for consecutive roles
+Claude Code parameter compatibility
+​
+Google/Gemini
+Turn ordering fixes (applyGoogleTurnOrderingFix)
+Tool schema sanitization (sanitizeToolsForGoogle)
+Session history sanitization (sanitizeSessionHistory)
+​
+OpenAI
+apply_patch tool for Codex models
+Thinking level downgrade handling
+​
+TUI Integration
+OpenClaw also has a local TUI mode that uses pi-tui components directly:
+// src/tui/tui.ts
+import { ... } from "@mariozechner/pi-tui";
+This provides the interactive terminal experience similar to pi’s native mode.
+​
+Key Differences from Pi CLI
+Aspect	Pi CLI	OpenClaw Embedded
+Invocation	pi command / RPC	SDK via createAgentSession()
+Tools	Default coding tools	Custom OpenClaw tool suite
+System prompt	AGENTS.md + prompts	Dynamic per-channel/context
+Session storage	~/.pi/agent/sessions/	~/.openclaw/agents/<agentId>/sessions/ (or $OPENCLAW_STATE_DIR/agents/<agentId>/sessions/)
+Auth	Single credential	Multi-profile with rotation
+Extensions	Loaded from disk	Programmatic + disk paths
+Event handling	TUI rendering	Callback-based (onBlockReply, etc.)
+​
+Future Considerations
+Areas for potential rework:
+Tool signature alignment: Currently adapting between pi-agent-core and pi-coding-agent signatures
+Session manager wrapping: guardSessionManager adds safety but increases complexity
+Extension loading: Could use pi’s ResourceLoader more directly
+Streaming handler complexity: subscribeEmbeddedPiSession has grown large
+Provider quirks: Many provider-specific codepaths that pi could potentially handle
+​
+Tests
+Pi integration coverage spans these suites:
+src/agents/pi-*.test.ts
+src/agents/pi-auth-json.test.ts
+src/agents/pi-embedded-*.test.ts
+src/agents/pi-embedded-helpers*.test.ts
+src/agents/pi-embedded-runner*.test.ts
+src/agents/pi-embedded-runner/**/*.test.ts
+src/agents/pi-embedded-subscribe*.test.ts
+src/agents/pi-tools*.test.ts
+src/agents/pi-tool-definition-adapter*.test.ts
+src/agents/pi-settings.test.ts
+src/agents/pi-extensions/**/*.test.ts
+Live/opt-in:
+src/agents/pi-embedded-runner-extraparams.live.test.ts (enable OPENCLAW_LIVE_TEST=1)
+For current run commands, see Pi Development Workflow.
+
+
+
+Fundamentals
+Gateway Architecture
+Last updated: 2026-01-22
+​
+Overview
+A single long‑lived Gateway owns all messaging surfaces (WhatsApp via Baileys, Telegram via grammY, Slack, Discord, Signal, iMessage, WebChat).
+Control-plane clients (macOS app, CLI, web UI, automations) connect to the Gateway over WebSocket on the configured bind host (default 127.0.0.1:18789).
+Nodes (macOS/iOS/Android/headless) also connect over WebSocket, but declare role: node with explicit caps/commands.
+One Gateway per host; it is the only place that opens a WhatsApp session.
+The canvas host is served by the Gateway HTTP server under:
+/__openclaw__/canvas/ (agent-editable HTML/CSS/JS)
+/__openclaw__/a2ui/ (A2UI host) It uses the same port as the Gateway (default 18789).
+​
+Components and flows
+​
+Gateway (daemon)
+Maintains provider connections.
+Exposes a typed WS API (requests, responses, server‑push events).
+Validates inbound frames against JSON Schema.
+Emits events like agent, chat, presence, health, heartbeat, cron.
+​
+Clients (mac app / CLI / web admin)
+One WS connection per client.
+Send requests (health, status, send, agent, system-presence).
+Subscribe to events (tick, agent, presence, shutdown).
+​
+Nodes (macOS / iOS / Android / headless)
+Connect to the same WS server with role: node.
+Provide a device identity in connect; pairing is device‑based (role node) and approval lives in the device pairing store.
+Expose commands like canvas.*, camera.*, screen.record, location.get.
+Protocol details:
+Gateway protocol
+​
+WebChat
+Static UI that uses the Gateway WS API for chat history and sends.
+In remote setups, connects through the same SSH/Tailscale tunnel as other clients.
+​
+Connection lifecycle (single client)
+
+
+
+
+
+
+
+Gateway
+Client
+Gateway
+Client
+or res error + close
+payload=hello-ok
+snapshot: presence + health
+req:connect
+res (ok)
+event:presence
+event:tick
+req:agent
+res:agent
+ack {runId, status:"accepted"}
+event:agent
+(streaming)
+res:agent
+final {runId, status, summary}
+​
+Wire protocol (summary)
+Transport: WebSocket, text frames with JSON payloads.
+First frame must be connect.
+After handshake:
+Requests: {type:"req", id, method, params} → {type:"res", id, ok, payload|error}
+Events: {type:"event", event, payload, seq?, stateVersion?}
+If OPENCLAW_GATEWAY_TOKEN (or --token) is set, connect.params.auth.token must match or the socket closes.
+Idempotency keys are required for side‑effecting methods (send, agent) to safely retry; the server keeps a short‑lived dedupe cache.
+Nodes must include role: "node" plus caps/commands/permissions in connect.
+​
+Pairing + local trust
+All WS clients (operators + nodes) include a device identity on connect.
+New device IDs require pairing approval; the Gateway issues a device token for subsequent connects.
+Local connects (loopback or the gateway host’s own tailnet address) can be auto‑approved to keep same‑host UX smooth.
+All connects must sign the connect.challenge nonce.
+Signature payload v3 also binds platform + deviceFamily; the gateway pins paired metadata on reconnect and requires repair pairing for metadata changes.
+Non‑local connects still require explicit approval.
+Gateway auth (gateway.auth.*) still applies to all connections, local or remote.
+Details: Gateway protocol, Pairing, Security.
+​
+Protocol typing and codegen
+TypeBox schemas define the protocol.
+JSON Schema is generated from those schemas.
+Swift models are generated from the JSON Schema.
+​
+Remote access
+Preferred: Tailscale or VPN.
+Alternative: SSH tunnel
+ssh -N -L 18789:127.0.0.1:18789 user@host
+The same handshake + auth token apply over the tunnel.
+TLS + optional pinning can be enabled for WS in remote setups.
+​
+Operations snapshot
+Start: openclaw gateway (foreground, logs to stdout).
+Health: health over WS (also included in hello-ok).
+Supervision: launchd/systemd for auto‑restart.
+​
+Invariants
+Exactly one Gateway controls a single Baileys session per host.
+Handshake is mandatory; any non‑JSON or non‑connect first frame is a hard close.
+Events are not replayed; clients must refresh on gaps.
+
+
+
+Fundamentals
+Agent Runtime
+OpenClaw runs a single embedded agent runtime derived from pi-mono.
+​
+Workspace (required)
+OpenClaw uses a single agent workspace directory (agents.defaults.workspace) as the agent’s only working directory (cwd) for tools and context.
+Recommended: use openclaw setup to create ~/.openclaw/openclaw.json if missing and initialize the workspace files.
+Full workspace layout + backup guide: Agent workspace
+If agents.defaults.sandbox is enabled, non-main sessions can override this with per-session workspaces under agents.defaults.sandbox.workspaceRoot (see Gateway configuration).
+​
+Bootstrap files (injected)
+Inside agents.defaults.workspace, OpenClaw expects these user-editable files:
+AGENTS.md — operating instructions + “memory”
+SOUL.md — persona, boundaries, tone
+TOOLS.md — user-maintained tool notes (e.g. imsg, sag, conventions)
+BOOTSTRAP.md — one-time first-run ritual (deleted after completion)
+IDENTITY.md — agent name/vibe/emoji
+USER.md — user profile + preferred address
+On the first turn of a new session, OpenClaw injects the contents of these files directly into the agent context.
+Blank files are skipped. Large files are trimmed and truncated with a marker so prompts stay lean (read the file for full content).
+If a file is missing, OpenClaw injects a single “missing file” marker line (and openclaw setup will create a safe default template).
+BOOTSTRAP.md is only created for a brand new workspace (no other bootstrap files present). If you delete it after completing the ritual, it should not be recreated on later restarts.
+To disable bootstrap file creation entirely (for pre-seeded workspaces), set:
+{ agent: { skipBootstrap: true } }
+​
+Built-in tools
+Core tools (read/exec/edit/write and related system tools) are always available, subject to tool policy. apply_patch is optional and gated by tools.exec.applyPatch. TOOLS.md does not control which tools exist; it’s guidance for how you want them used.
+​
+Skills
+OpenClaw loads skills from three locations (workspace wins on name conflict):
+Bundled (shipped with the install)
+Managed/local: ~/.openclaw/skills
+Workspace: <workspace>/skills
+Skills can be gated by config/env (see skills in Gateway configuration).
+​
+pi-mono integration
+OpenClaw reuses pieces of the pi-mono codebase (models/tools), but session management, discovery, and tool wiring are OpenClaw-owned.
+No pi-coding agent runtime.
+No ~/.pi/agent or <workspace>/.pi settings are consulted.
+​
+Sessions
+Session transcripts are stored as JSONL at:
+~/.openclaw/agents/<agentId>/sessions/<SessionId>.jsonl
+The session ID is stable and chosen by OpenClaw. Legacy Pi/Tau session folders are not read.
+​
+Steering while streaming
+When queue mode is steer, inbound messages are injected into the current run. The queue is checked after each tool call; if a queued message is present, remaining tool calls from the current assistant message are skipped (error tool results with “Skipped due to queued user message.”), then the queued user message is injected before the next assistant response.
+When queue mode is followup or collect, inbound messages are held until the current turn ends, then a new agent turn starts with the queued payloads. See Queue for mode + debounce/cap behavior.
+Block streaming sends completed assistant blocks as soon as they finish; it is off by default (agents.defaults.blockStreamingDefault: "off"). Tune the boundary via agents.defaults.blockStreamingBreak (text_end vs message_end; defaults to text_end). Control soft block chunking with agents.defaults.blockStreamingChunk (defaults to 800–1200 chars; prefers paragraph breaks, then newlines; sentences last). Coalesce streamed chunks with agents.defaults.blockStreamingCoalesce to reduce single-line spam (idle-based merging before send). Non-Telegram channels require explicit *.blockStreaming: true to enable block replies. Verbose tool summaries are emitted at tool start (no debounce); Control UI streams tool output via agent events when available. More details: Streaming + chunking.
+​
+Model refs
+Model refs in config (for example agents.defaults.model and agents.defaults.models) are parsed by splitting on the first /.
+Use provider/model when configuring models.
+If the model ID itself contains / (OpenRouter-style), include the provider prefix (example: openrouter/moonshotai/kimi-k2).
+If you omit the provider, OpenClaw treats the input as an alias or a model for the default provider (only works when there is no / in the model ID).
+​
+Configuration (minimal)
+At minimum, set:
+agents.defaults.workspace
+channels.whatsapp.allowFrom (strongly recommended)
+
+
+
+Fundamentals
+Agent Loop
+An agentic loop is the full “real” run of an agent: intake → context assembly → model inference → tool execution → streaming replies → persistence. It’s the authoritative path that turns a message into actions and a final reply, while keeping session state consistent.
+In OpenClaw, a loop is a single, serialized run per session that emits lifecycle and stream events as the model thinks, calls tools, and streams output. This doc explains how that authentic loop is wired end-to-end.
+​
+Entry points
+Gateway RPC: agent and agent.wait.
+CLI: agent command.
+​
+How it works (high-level)
+agent RPC validates params, resolves session (sessionKey/sessionId), persists session metadata, returns { runId, acceptedAt } immediately.
+agentCommand runs the agent:
+resolves model + thinking/verbose defaults
+loads skills snapshot
+calls runEmbeddedPiAgent (pi-agent-core runtime)
+emits lifecycle end/error if the embedded loop does not emit one
+runEmbeddedPiAgent:
+serializes runs via per-session + global queues
+resolves model + auth profile and builds the pi session
+subscribes to pi events and streams assistant/tool deltas
+enforces timeout -> aborts run if exceeded
+returns payloads + usage metadata
+subscribeEmbeddedPiSession bridges pi-agent-core events to OpenClaw agent stream:
+tool events => stream: "tool"
+assistant deltas => stream: "assistant"
+lifecycle events => stream: "lifecycle" (phase: "start" | "end" | "error")
+agent.wait uses waitForAgentJob:
+waits for lifecycle end/error for runId
+returns { status: ok|error|timeout, startedAt, endedAt, error? }
+​
+Queueing + concurrency
+Runs are serialized per session key (session lane) and optionally through a global lane.
+This prevents tool/session races and keeps session history consistent.
+Messaging channels can choose queue modes (collect/steer/followup) that feed this lane system. See Command Queue.
+​
+Session + workspace preparation
+Workspace is resolved and created; sandboxed runs may redirect to a sandbox workspace root.
+Skills are loaded (or reused from a snapshot) and injected into env and prompt.
+Bootstrap/context files are resolved and injected into the system prompt report.
+A session write lock is acquired; SessionManager is opened and prepared before streaming.
+​
+Prompt assembly + system prompt
+System prompt is built from OpenClaw’s base prompt, skills prompt, bootstrap context, and per-run overrides.
+Model-specific limits and compaction reserve tokens are enforced.
+See System prompt for what the model sees.
+​
+Hook points (where you can intercept)
+OpenClaw has two hook systems:
+Internal hooks (Gateway hooks): event-driven scripts for commands and lifecycle events.
+Plugin hooks: extension points inside the agent/tool lifecycle and gateway pipeline.
+​
+Internal hooks (Gateway hooks)
+agent:bootstrap: runs while building bootstrap files before the system prompt is finalized. Use this to add/remove bootstrap context files.
+Command hooks: /new, /reset, /stop, and other command events (see Hooks doc).
+See Hooks for setup and examples.
+​
+Plugin hooks (agent + gateway lifecycle)
+These run inside the agent loop or gateway pipeline:
+before_model_resolve: runs pre-session (no messages) to deterministically override provider/model before model resolution.
+before_prompt_build: runs after session load (with messages) to inject prependContext, systemPrompt, prependSystemContext, or appendSystemContext before prompt submission. Use prependContext for per-turn dynamic text and system-context fields for stable guidance that should sit in system prompt space.
+before_agent_start: legacy compatibility hook that may run in either phase; prefer the explicit hooks above.
+agent_end: inspect the final message list and run metadata after completion.
+before_compaction / after_compaction: observe or annotate compaction cycles.
+before_tool_call / after_tool_call: intercept tool params/results.
+tool_result_persist: synchronously transform tool results before they are written to the session transcript.
+message_received / message_sending / message_sent: inbound + outbound message hooks.
+session_start / session_end: session lifecycle boundaries.
+gateway_start / gateway_stop: gateway lifecycle events.
+See Plugin hooks for the hook API and registration details.
+​
+Streaming + partial replies
+Assistant deltas are streamed from pi-agent-core and emitted as assistant events.
+Block streaming can emit partial replies either on text_end or message_end.
+Reasoning streaming can be emitted as a separate stream or as block replies.
+See Streaming for chunking and block reply behavior.
+​
+Tool execution + messaging tools
+Tool start/update/end events are emitted on the tool stream.
+Tool results are sanitized for size and image payloads before logging/emitting.
+Messaging tool sends are tracked to suppress duplicate assistant confirmations.
+​
+Reply shaping + suppression
+Final payloads are assembled from:
+assistant text (and optional reasoning)
+inline tool summaries (when verbose + allowed)
+assistant error text when the model errors
+NO_REPLY is treated as a silent token and filtered from outgoing payloads.
+Messaging tool duplicates are removed from the final payload list.
+If no renderable payloads remain and a tool errored, a fallback tool error reply is emitted (unless a messaging tool already sent a user-visible reply).
+​
+Compaction + retries
+Auto-compaction emits compaction stream events and can trigger a retry.
+On retry, in-memory buffers and tool summaries are reset to avoid duplicate output.
+See Compaction for the compaction pipeline.
+​
+Event streams (today)
+lifecycle: emitted by subscribeEmbeddedPiSession (and as a fallback by agentCommand)
+assistant: streamed deltas from pi-agent-core
+tool: streamed tool events from pi-agent-core
+​
+Chat channel handling
+Assistant deltas are buffered into chat delta messages.
+A chat final is emitted on lifecycle end/error.
+​
+Timeouts
+agent.wait default: 30s (just the wait). timeoutMs param overrides.
+Agent runtime: agents.defaults.timeoutSeconds default 600s; enforced in runEmbeddedPiAgent abort timer.
+​
+Where things can end early
+Agent timeout (abort)
+AbortSignal (cancel)
+Gateway disconnect or RPC timeout
+agent.wait timeout (wait-only, does not stop agent)
+
+
+
+
+Fundamentals
+System Prompt
+OpenClaw builds a custom system prompt for every agent run. The prompt is OpenClaw-owned and does not use the pi-coding-agent default prompt.
+The prompt is assembled by OpenClaw and injected into each agent run.
+​
+Structure
+The prompt is intentionally compact and uses fixed sections:
+Tooling: current tool list + short descriptions.
+Safety: short guardrail reminder to avoid power-seeking behavior or bypassing oversight.
+Skills (when available): tells the model how to load skill instructions on demand.
+OpenClaw Self-Update: how to run config.apply and update.run.
+Workspace: working directory (agents.defaults.workspace).
+Documentation: local path to OpenClaw docs (repo or npm package) and when to read them.
+Workspace Files (injected): indicates bootstrap files are included below.
+Sandbox (when enabled): indicates sandboxed runtime, sandbox paths, and whether elevated exec is available.
+Current Date & Time: user-local time, timezone, and time format.
+Reply Tags: optional reply tag syntax for supported providers.
+Heartbeats: heartbeat prompt and ack behavior.
+Runtime: host, OS, node, model, repo root (when detected), thinking level (one line).
+Reasoning: current visibility level + /reasoning toggle hint.
+Safety guardrails in the system prompt are advisory. They guide model behavior but do not enforce policy. Use tool policy, exec approvals, sandboxing, and channel allowlists for hard enforcement; operators can disable these by design.
+​
+Prompt modes
+OpenClaw can render smaller system prompts for sub-agents. The runtime sets a promptMode for each run (not a user-facing config):
+full (default): includes all sections above.
+minimal: used for sub-agents; omits Skills, Memory Recall, OpenClaw Self-Update, Model Aliases, User Identity, Reply Tags, Messaging, Silent Replies, and Heartbeats. Tooling, Safety, Workspace, Sandbox, Current Date & Time (when known), Runtime, and injected context stay available.
+none: returns only the base identity line.
+When promptMode=minimal, extra injected prompts are labeled Subagent Context instead of Group Chat Context.
+​
+Workspace bootstrap injection
+Bootstrap files are trimmed and appended under Project Context so the model sees identity and profile context without needing explicit reads:
+AGENTS.md
+SOUL.md
+TOOLS.md
+IDENTITY.md
+USER.md
+HEARTBEAT.md
+BOOTSTRAP.md (only on brand-new workspaces)
+MEMORY.md when present, otherwise memory.md as a lowercase fallback
+All of these files are injected into the context window on every turn, which means they consume tokens. Keep them concise — especially MEMORY.md, which can grow over time and lead to unexpectedly high context usage and more frequent compaction.
+Note: memory/*.md daily files are not injected automatically. They are accessed on demand via the memory_search and memory_get tools, so they do not count against the context window unless the model explicitly reads them.
+Large files are truncated with a marker. The max per-file size is controlled by agents.defaults.bootstrapMaxChars (default: 20000). Total injected bootstrap content across files is capped by agents.defaults.bootstrapTotalMaxChars (default: 150000). Missing files inject a short missing-file marker. When truncation occurs, OpenClaw can inject a warning block in Project Context; control this with agents.defaults.bootstrapPromptTruncationWarning (off, once, always; default: once).
+Sub-agent sessions only inject AGENTS.md and TOOLS.md (other bootstrap files are filtered out to keep the sub-agent context small).
+Internal hooks can intercept this step via agent:bootstrap to mutate or replace the injected bootstrap files (for example swapping SOUL.md for an alternate persona).
+To inspect how much each injected file contributes (raw vs injected, truncation, plus tool schema overhead), use /context list or /context detail. See Context.
+​
+Time handling
+The system prompt includes a dedicated Current Date & Time section when the user timezone is known. To keep the prompt cache-stable, it now only includes the time zone (no dynamic clock or time format).
+Use session_status when the agent needs the current time; the status card includes a timestamp line.
+Configure with:
+agents.defaults.userTimezone
+agents.defaults.timeFormat (auto | 12 | 24)
+See Date & Time for full behavior details.
+​
+Skills
+When eligible skills exist, OpenClaw injects a compact available skills list (formatSkillsForPrompt) that includes the file path for each skill. The prompt instructs the model to use read to load the SKILL.md at the listed location (workspace, managed, or bundled). If no skills are eligible, the Skills section is omitted.
+<available_skills>
+  <skill>
+    <name>...</name>
+    <description>...</description>
+    <location>...</location>
+  </skill>
+</available_skills>
+This keeps the base prompt small while still enabling targeted skill usage.
+​
+Documentation
+When available, the system prompt includes a Documentation section that points to the local OpenClaw docs directory (either docs/ in the repo workspace or the bundled npm package docs) and also notes the public mirror, source repo, community Discord, and ClawHub (https://clawhub.com) for skills discovery. The prompt instructs the model to consult local docs first for OpenClaw behavior, commands, configuration, or architecture, and to run openclaw status itself when possible (asking the user only when it lacks access).
+
+
+
+Fundamentals
+Context
+“Context” is everything OpenClaw sends to the model for a run. It is bounded by the model’s context window (token limit).
+Beginner mental model:
+System prompt (OpenClaw-built): rules, tools, skills list, time/runtime, and injected workspace files.
+Conversation history: your messages + the assistant’s messages for this session.
+Tool calls/results + attachments: command output, file reads, images/audio, etc.
+Context is not the same thing as “memory”: memory can be stored on disk and reloaded later; context is what’s inside the model’s current window.
+​
+Quick start (inspect context)
+/status → quick “how full is my window?” view + session settings.
+/context list → what’s injected + rough sizes (per file + totals).
+/context detail → deeper breakdown: per-file, per-tool schema sizes, per-skill entry sizes, and system prompt size.
+/usage tokens → append per-reply usage footer to normal replies.
+/compact → summarize older history into a compact entry to free window space.
+See also: Slash commands, Token use & costs, Compaction.
+​
+Example output
+Values vary by model, provider, tool policy, and what’s in your workspace.
+​
+/context list
+🧠 Context breakdown
+Workspace: <workspaceDir>
+Bootstrap max/file: 20,000 chars
+Sandbox: mode=non-main sandboxed=false
+System prompt (run): 38,412 chars (~9,603 tok) (Project Context 23,901 chars (~5,976 tok))
+
+Injected workspace files:
+- AGENTS.md: OK | raw 1,742 chars (~436 tok) | injected 1,742 chars (~436 tok)
+- SOUL.md: OK | raw 912 chars (~228 tok) | injected 912 chars (~228 tok)
+- TOOLS.md: TRUNCATED | raw 54,210 chars (~13,553 tok) | injected 20,962 chars (~5,241 tok)
+- IDENTITY.md: OK | raw 211 chars (~53 tok) | injected 211 chars (~53 tok)
+- USER.md: OK | raw 388 chars (~97 tok) | injected 388 chars (~97 tok)
+- HEARTBEAT.md: MISSING | raw 0 | injected 0
+- BOOTSTRAP.md: OK | raw 0 chars (~0 tok) | injected 0 chars (~0 tok)
+
+Skills list (system prompt text): 2,184 chars (~546 tok) (12 skills)
+Tools: read, edit, write, exec, process, browser, message, sessions_send, …
+Tool list (system prompt text): 1,032 chars (~258 tok)
+Tool schemas (JSON): 31,988 chars (~7,997 tok) (counts toward context; not shown as text)
+Tools: (same as above)
+
+Session tokens (cached): 14,250 total / ctx=32,000
+​
+/context detail
+🧠 Context breakdown (detailed)
+…
+Top skills (prompt entry size):
+- frontend-design: 412 chars (~103 tok)
+- oracle: 401 chars (~101 tok)
+… (+10 more skills)
+
+Top tools (schema size):
+- browser: 9,812 chars (~2,453 tok)
+- exec: 6,240 chars (~1,560 tok)
+… (+N more tools)
+​
+What counts toward the context window
+Everything the model receives counts, including:
+System prompt (all sections).
+Conversation history.
+Tool calls + tool results.
+Attachments/transcripts (images/audio/files).
+Compaction summaries and pruning artifacts.
+Provider “wrappers” or hidden headers (not visible, still counted).
+​
+How OpenClaw builds the system prompt
+The system prompt is OpenClaw-owned and rebuilt each run. It includes:
+Tool list + short descriptions.
+Skills list (metadata only; see below).
+Workspace location.
+Time (UTC + converted user time if configured).
+Runtime metadata (host/OS/model/thinking).
+Injected workspace bootstrap files under Project Context.
+Full breakdown: System Prompt.
+​
+Injected workspace files (Project Context)
+By default, OpenClaw injects a fixed set of workspace files (if present):
+AGENTS.md
+SOUL.md
+TOOLS.md
+IDENTITY.md
+USER.md
+HEARTBEAT.md
+BOOTSTRAP.md (first-run only)
+Large files are truncated per-file using agents.defaults.bootstrapMaxChars (default 20000 chars). OpenClaw also enforces a total bootstrap injection cap across files with agents.defaults.bootstrapTotalMaxChars (default 150000 chars). /context shows raw vs injected sizes and whether truncation happened.
+When truncation occurs, the runtime can inject an in-prompt warning block under Project Context. Configure this with agents.defaults.bootstrapPromptTruncationWarning (off, once, always; default once).
+​
+Skills: injected vs loaded on-demand
+The system prompt includes a compact skills list (name + description + location). This list has real overhead.
+Skill instructions are not included by default. The model is expected to read the skill’s SKILL.md only when needed.
+​
+Tools: there are two costs
+Tools affect context in two ways:
+Tool list text in the system prompt (what you see as “Tooling”).
+Tool schemas (JSON). These are sent to the model so it can call tools. They count toward context even though you don’t see them as plain text.
+/context detail breaks down the biggest tool schemas so you can see what dominates.
+​
+Commands, directives, and “inline shortcuts”
+Slash commands are handled by the Gateway. There are a few different behaviors:
+Standalone commands: a message that is only /... runs as a command.
+Directives: /think, /verbose, /reasoning, /elevated, /model, /queue are stripped before the model sees the message.
+Directive-only messages persist session settings.
+Inline directives in a normal message act as per-message hints.
+Inline shortcuts (allowlisted senders only): certain /... tokens inside a normal message can run immediately (example: “hey /status”), and are stripped before the model sees the remaining text.
+Details: Slash commands.
+​
+Sessions, compaction, and pruning (what persists)
+What persists across messages depends on the mechanism:
+Normal history persists in the session transcript until compacted/pruned by policy.
+Compaction persists a summary into the transcript and keeps recent messages intact.
+Pruning removes old tool results from the in-memory prompt for a run, but does not rewrite the transcript.
+Docs: Session, Compaction, Session pruning.
+By default, OpenClaw uses the built-in legacy context engine for assembly and compaction. If you install a plugin that provides kind: "context-engine" and select it with plugins.slots.contextEngine, OpenClaw delegates context assembly, /compact, and related subagent context lifecycle hooks to that engine instead. ownsCompaction: false does not auto-fallback to the legacy engine; the active engine must still implement compact() correctly. See Context Engine for the full pluggable interface, lifecycle hooks, and configuration.
+​
+What /context actually reports
+/context prefers the latest run-built system prompt report when available:
+System prompt (run) = captured from the last embedded (tool-capable) run and persisted in the session store.
+System prompt (estimate) = computed on the fly when no run report exists (or when running via a CLI backend that doesn’t generate the report).
+Either way, it reports sizes and top contributors; it does not dump the full system prompt or tool schemas.
+
+
+
+Fundamentals
+Context Engine
+A context engine controls how OpenClaw builds model context for each run. It decides which messages to include, how to summarize older history, and how to manage context across subagent boundaries.
+OpenClaw ships with a built-in legacy engine. Plugins can register alternative engines that replace the active context-engine lifecycle.
+​
+Quick start
+Check which engine is active:
+openclaw doctor
+# or inspect config directly:
+cat ~/.openclaw/openclaw.json | jq '.plugins.slots.contextEngine'
+​
+Installing a context engine plugin
+Context engine plugins are installed like any other OpenClaw plugin. Install first, then select the engine in the slot:
+# Install from npm
+openclaw plugins install @martian-engineering/lossless-claw
+
+# Or install from a local path (for development)
+openclaw plugins install -l ./my-context-engine
+Then enable the plugin and select it as the active engine in your config:
+// openclaw.json
+{
+  plugins: {
+    slots: {
+      contextEngine: "lossless-claw", // must match the plugin's registered engine id
+    },
+    entries: {
+      "lossless-claw": {
+        enabled: true,
+        // Plugin-specific config goes here (see the plugin's docs)
+      },
+    },
+  },
+}
+Restart the gateway after installing and configuring.
+To switch back to the built-in engine, set contextEngine to "legacy" (or remove the key entirely — "legacy" is the default).
+​
+How it works
+Every time OpenClaw runs a model prompt, the context engine participates at four lifecycle points:
+Ingest — called when a new message is added to the session. The engine can store or index the message in its own data store.
+Assemble — called before each model run. The engine returns an ordered set of messages (and an optional systemPromptAddition) that fit within the token budget.
+Compact — called when the context window is full, or when the user runs /compact. The engine summarizes older history to free space.
+After turn — called after a run completes. The engine can persist state, trigger background compaction, or update indexes.
+​
+Subagent lifecycle (optional)
+OpenClaw currently calls one subagent lifecycle hook:
+onSubagentEnded — clean up when a subagent session completes or is swept.
+The prepareSubagentSpawn hook is part of the interface for future use, but the runtime does not invoke it yet.
+​
+System prompt addition
+The assemble method can return a systemPromptAddition string. OpenClaw prepends this to the system prompt for the run. This lets engines inject dynamic recall guidance, retrieval instructions, or context-aware hints without requiring static workspace files.
+​
+The legacy engine
+The built-in legacy engine preserves OpenClaw’s original behavior:
+Ingest: no-op (the session manager handles message persistence directly).
+Assemble: pass-through (the existing sanitize → validate → limit pipeline in the runtime handles context assembly).
+Compact: delegates to the built-in summarization compaction, which creates a single summary of older messages and keeps recent messages intact.
+After turn: no-op.
+The legacy engine does not register tools or provide a systemPromptAddition.
+When no plugins.slots.contextEngine is set (or it’s set to "legacy"), this engine is used automatically.
+​
+Plugin engines
+A plugin can register a context engine using the plugin API:
+export default function register(api) {
+  api.registerContextEngine("my-engine", () => ({
+    info: {
+      id: "my-engine",
+      name: "My Context Engine",
+      ownsCompaction: true,
+    },
+
+    async ingest({ sessionId, message, isHeartbeat }) {
+      // Store the message in your data store
+      return { ingested: true };
+    },
+
+    async assemble({ sessionId, messages, tokenBudget }) {
+      // Return messages that fit the budget
+      return {
+        messages: buildContext(messages, tokenBudget),
+        estimatedTokens: countTokens(messages),
+        systemPromptAddition: "Use lcm_grep to search history...",
+      };
+    },
+
+    async compact({ sessionId, force }) {
+      // Summarize older context
+      return { ok: true, compacted: true };
+    },
+  }));
+}
+Then enable it in config:
+{
+  plugins: {
+    slots: {
+      contextEngine: "my-engine",
+    },
+    entries: {
+      "my-engine": {
+        enabled: true,
+      },
+    },
+  },
+}
+​
+The ContextEngine interface
+Required members:
+Member	Kind	Purpose
+info	Property	Engine id, name, version, and whether it owns compaction
+ingest(params)	Method	Store a single message
+assemble(params)	Method	Build context for a model run (returns AssembleResult)
+compact(params)	Method	Summarize/reduce context
+assemble returns an AssembleResult with:
+messages — the ordered messages to send to the model.
+estimatedTokens (required, number) — the engine’s estimate of total tokens in the assembled context. OpenClaw uses this for compaction threshold decisions and diagnostic reporting.
+systemPromptAddition (optional, string) — prepended to the system prompt.
+Optional members:
+Member	Kind	Purpose
+bootstrap(params)	Method	Initialize engine state for a session. Called once when the engine first sees a session (e.g., import history).
+ingestBatch(params)	Method	Ingest a completed turn as a batch. Called after a run completes, with all messages from that turn at once.
+afterTurn(params)	Method	Post-run lifecycle work (persist state, trigger background compaction).
+prepareSubagentSpawn(params)	Method	Set up shared state for a child session.
+onSubagentEnded(params)	Method	Clean up after a subagent ends.
+dispose()	Method	Release resources. Called during gateway shutdown or plugin reload — not per-session.
+​
+ownsCompaction
+ownsCompaction controls whether Pi’s built-in in-attempt auto-compaction stays enabled for the run:
+true — the engine owns compaction behavior. OpenClaw disables Pi’s built-in auto-compaction for that run, and the engine’s compact() implementation is responsible for /compact, overflow recovery compaction, and any proactive compaction it wants to do in afterTurn().
+false or unset — Pi’s built-in auto-compaction may still run during prompt execution, but the active engine’s compact() method is still called for /compact and overflow recovery.
+ownsCompaction: false does not mean OpenClaw automatically falls back to the legacy engine’s compaction path.
+That means there are two valid plugin patterns:
+Owning mode — implement your own compaction algorithm and set ownsCompaction: true.
+Delegating mode — set ownsCompaction: false and have compact() call delegateCompactionToRuntime(...) from openclaw/plugin-sdk/core to use OpenClaw’s built-in compaction behavior.
+A no-op compact() is unsafe for an active non-owning engine because it disables the normal /compact and overflow-recovery compaction path for that engine slot.
+​
+Configuration reference
+{
+  plugins: {
+    slots: {
+      // Select the active context engine. Default: "legacy".
+      // Set to a plugin id to use a plugin engine.
+      contextEngine: "legacy",
+    },
+  },
+}
+The slot is exclusive at run time — only one registered context engine is resolved for a given run or compaction operation. Other enabled kind: "context-engine" plugins can still load and run their registration code; plugins.slots.contextEngine only selects which registered engine id OpenClaw resolves when it needs a context engine.
+​
+Relationship to compaction and memory
+Compaction is one responsibility of the context engine. The legacy engine delegates to OpenClaw’s built-in summarization. Plugin engines can implement any compaction strategy (DAG summaries, vector retrieval, etc.).
+Memory plugins (plugins.slots.memory) are separate from context engines. Memory plugins provide search/retrieval; context engines control what the model sees. They can work together — a context engine might use memory plugin data during assembly.
+Session pruning (trimming old tool results in-memory) still runs regardless of which context engine is active.
+​
+Tips
+Use openclaw doctor to verify your engine is loading correctly.
+If switching engines, existing sessions continue with their current history. The new engine takes over for future runs.
+Engine errors are logged and surfaced in diagnostics. If a plugin engine fails to register or the selected engine id cannot be resolved, OpenClaw does not fall back automatically; runs fail until you fix the plugin or switch plugins.slots.contextEngine back to "legacy".
+For development, use openclaw plugins install -l ./my-engine to link a local plugin directory without copying.
+See also: Compaction, Context, Plugins, Plugin manifest.
+Context
+
+
+
+
+Fundamentals
+Agent Workspace
+The workspace is the agent’s home. It is the only working directory used for file tools and for workspace context. Keep it private and treat it as memory.
+This is separate from ~/.openclaw/, which stores config, credentials, and sessions.
+Important: the workspace is the default cwd, not a hard sandbox. Tools resolve relative paths against the workspace, but absolute paths can still reach elsewhere on the host unless sandboxing is enabled. If you need isolation, use agents.defaults.sandbox (and/or per‑agent sandbox config). When sandboxing is enabled and workspaceAccess is not "rw", tools operate inside a sandbox workspace under ~/.openclaw/sandboxes, not your host workspace.
+​
+Default location
+Default: ~/.openclaw/workspace
+If OPENCLAW_PROFILE is set and not "default", the default becomes ~/.openclaw/workspace-<profile>.
+Override in ~/.openclaw/openclaw.json:
+{
+  agent: {
+    workspace: "~/.openclaw/workspace",
+  },
+}
+openclaw onboard, openclaw configure, or openclaw setup will create the workspace and seed the bootstrap files if they are missing. Sandbox seed copies only accept regular in-workspace files; symlink/hardlink aliases that resolve outside the source workspace are ignored.
+If you already manage the workspace files yourself, you can disable bootstrap file creation:
+{ agent: { skipBootstrap: true } }
+​
+Extra workspace folders
+Older installs may have created ~/openclaw. Keeping multiple workspace directories around can cause confusing auth or state drift, because only one workspace is active at a time.
+Recommendation: keep a single active workspace. If you no longer use the extra folders, archive or move them to Trash (for example trash ~/openclaw). If you intentionally keep multiple workspaces, make sure agents.defaults.workspace points to the active one.
+openclaw doctor warns when it detects extra workspace directories.
+​
+Workspace file map (what each file means)
+These are the standard files OpenClaw expects inside the workspace:
+AGENTS.md
+Operating instructions for the agent and how it should use memory.
+Loaded at the start of every session.
+Good place for rules, priorities, and “how to behave” details.
+SOUL.md
+Persona, tone, and boundaries.
+Loaded every session.
+USER.md
+Who the user is and how to address them.
+Loaded every session.
+IDENTITY.md
+The agent’s name, vibe, and emoji.
+Created/updated during the bootstrap ritual.
+TOOLS.md
+Notes about your local tools and conventions.
+Does not control tool availability; it is only guidance.
+HEARTBEAT.md
+Optional tiny checklist for heartbeat runs.
+Keep it short to avoid token burn.
+BOOT.md
+Optional startup checklist executed on gateway restart when internal hooks are enabled.
+Keep it short; use the message tool for outbound sends.
+BOOTSTRAP.md
+One-time first-run ritual.
+Only created for a brand-new workspace.
+Delete it after the ritual is complete.
+memory/YYYY-MM-DD.md
+Daily memory log (one file per day).
+Recommended to read today + yesterday on session start.
+MEMORY.md (optional)
+Curated long-term memory.
+Only load in the main, private session (not shared/group contexts).
+See Memory for the workflow and automatic memory flush.
+skills/ (optional)
+Workspace-specific skills.
+Overrides managed/bundled skills when names collide.
+canvas/ (optional)
+Canvas UI files for node displays (for example canvas/index.html).
+If any bootstrap file is missing, OpenClaw injects a “missing file” marker into the session and continues. Large bootstrap files are truncated when injected; adjust limits with agents.defaults.bootstrapMaxChars (default: 20000) and agents.defaults.bootstrapTotalMaxChars (default: 150000). openclaw setup can recreate missing defaults without overwriting existing files.
+​
+What is NOT in the workspace
+These live under ~/.openclaw/ and should NOT be committed to the workspace repo:
+~/.openclaw/openclaw.json (config)
+~/.openclaw/credentials/ (OAuth tokens, API keys)
+~/.openclaw/agents/<agentId>/sessions/ (session transcripts + metadata)
+~/.openclaw/skills/ (managed skills)
+If you need to migrate sessions or config, copy them separately and keep them out of version control.
+​
+Git backup (recommended, private)
+Treat the workspace as private memory. Put it in a private git repo so it is backed up and recoverable.
+Run these steps on the machine where the Gateway runs (that is where the workspace lives).
+​
+1) Initialize the repo
+If git is installed, brand-new workspaces are initialized automatically. If this workspace is not already a repo, run:
+cd ~/.openclaw/workspace
+git init
+git add AGENTS.md SOUL.md TOOLS.md IDENTITY.md USER.md HEARTBEAT.md memory/
+git commit -m "Add agent workspace"
+​
+2) Add a private remote (beginner-friendly options)
+Option A: GitHub web UI
+Create a new private repository on GitHub.
+Do not initialize with a README (avoids merge conflicts).
+Copy the HTTPS remote URL.
+Add the remote and push:
+git branch -M main
+git remote add origin <https-url>
+git push -u origin main
+Option B: GitHub CLI (gh)
+gh auth login
+gh repo create openclaw-workspace --private --source . --remote origin --push
+Option C: GitLab web UI
+Create a new private repository on GitLab.
+Do not initialize with a README (avoids merge conflicts).
+Copy the HTTPS remote URL.
+Add the remote and push:
+git branch -M main
+git remote add origin <https-url>
+git push -u origin main
+​
+3) Ongoing updates
+git status
+git add .
+git commit -m "Update memory"
+git push
+​
+Do not commit secrets
+Even in a private repo, avoid storing secrets in the workspace:
+API keys, OAuth tokens, passwords, or private credentials.
+Anything under ~/.openclaw/.
+Raw dumps of chats or sensitive attachments.
+If you must store sensitive references, use placeholders and keep the real secret elsewhere (password manager, environment variables, or ~/.openclaw/).
+Suggested .gitignore starter:
+.DS_Store
+.env
+**/*.key
+**/*.pem
+**/secrets*
+​
+Moving the workspace to a new machine
+Clone the repo to the desired path (default ~/.openclaw/workspace).
+Set agents.defaults.workspace to that path in ~/.openclaw/openclaw.json.
+Run openclaw setup --workspace <path> to seed any missing files.
+If you need sessions, copy ~/.openclaw/agents/<agentId>/sessions/ from the old machine separately.
+​
+Advanced notes
+Multi-agent routing can use different workspaces per agent. See Channel routing for routing configuration.
+If agents.defaults.sandbox is enabled, non-main sessions can use per-session sandbox workspaces under agents.defaults.sandbox.workspaceRoot.
+
+
+
+
+Fundamentals
+OAuth
+OpenClaw supports “subscription auth” via OAuth for providers that offer it (notably OpenAI Codex (ChatGPT OAuth)). For Anthropic subscriptions, use the setup-token flow. Anthropic subscription use outside Claude Code has been restricted for some users in the past, so treat it as a user-choice risk and verify current Anthropic policy yourself. OpenAI Codex OAuth is explicitly supported for use in external tools like OpenClaw. This page explains:
+For Anthropic in production, API key auth is the safer recommended path over subscription setup-token auth.
+how the OAuth token exchange works (PKCE)
+where tokens are stored (and why)
+how to handle multiple accounts (profiles + per-session overrides)
+OpenClaw also supports provider plugins that ship their own OAuth or API‑key flows. Run them via:
+openclaw models auth login --provider <id>
+​
+The token sink (why it exists)
+OAuth providers commonly mint a new refresh token during login/refresh flows. Some providers (or OAuth clients) can invalidate older refresh tokens when a new one is issued for the same user/app.
+Practical symptom:
+you log in via OpenClaw and via Claude Code / Codex CLI → one of them randomly gets “logged out” later
+To reduce that, OpenClaw treats auth-profiles.json as a token sink:
+the runtime reads credentials from one place
+we can keep multiple profiles and route them deterministically
+​
+Storage (where tokens live)
+Secrets are stored per-agent:
+Auth profiles (OAuth + API keys + optional value-level refs): ~/.openclaw/agents/<agentId>/agent/auth-profiles.json
+Legacy compatibility file: ~/.openclaw/agents/<agentId>/agent/auth.json (static api_key entries are scrubbed when discovered)
+Legacy import-only file (still supported, but not the main store):
+~/.openclaw/credentials/oauth.json (imported into auth-profiles.json on first use)
+All of the above also respect $OPENCLAW_STATE_DIR (state dir override). Full reference: /gateway/configuration
+For static secret refs and runtime snapshot activation behavior, see Secrets Management.
+​
+Anthropic setup-token (subscription auth)
+Anthropic setup-token support is technical compatibility, not a policy guarantee. Anthropic has blocked some subscription usage outside Claude Code in the past. Decide for yourself whether to use subscription auth, and verify Anthropic’s current terms.
+Run claude setup-token on any machine, then paste it into OpenClaw:
+openclaw models auth setup-token --provider anthropic
+If you generated the token elsewhere, paste it manually:
+openclaw models auth paste-token --provider anthropic
+Verify:
+openclaw models status
+​
+OAuth exchange (how login works)
+OpenClaw’s interactive login flows are implemented in @mariozechner/pi-ai and wired into the wizards/commands.
+​
+Anthropic setup-token
+Flow shape:
+run claude setup-token
+paste the token into OpenClaw
+store as a token auth profile (no refresh)
+The wizard path is openclaw onboard → auth choice setup-token (Anthropic).
+​
+OpenAI Codex (ChatGPT OAuth)
+OpenAI Codex OAuth is explicitly supported for use outside the Codex CLI, including OpenClaw workflows.
+Flow shape (PKCE):
+generate PKCE verifier/challenge + random state
+open https://auth.openai.com/oauth/authorize?...
+try to capture callback on http://127.0.0.1:1455/auth/callback
+if callback can’t bind (or you’re remote/headless), paste the redirect URL/code
+exchange at https://auth.openai.com/oauth/token
+extract accountId from the access token and store { access, refresh, expires, accountId }
+Wizard path is openclaw onboard → auth choice openai-codex.
+​
+Refresh + expiry
+Profiles store an expires timestamp.
+At runtime:
+if expires is in the future → use the stored access token
+if expired → refresh (under a file lock) and overwrite the stored credentials
+The refresh flow is automatic; you generally don’t need to manage tokens manually.
+​
+Multiple accounts (profiles) + routing
+Two patterns:
+​
+1) Preferred: separate agents
+If you want “personal” and “work” to never interact, use isolated agents (separate sessions + credentials + workspace):
+openclaw agents add work
+openclaw agents add personal
+Then configure auth per-agent (wizard) and route chats to the right agent.
+​
+2) Advanced: multiple profiles in one agent
+auth-profiles.json supports multiple profile IDs for the same provider.
+Pick which profile is used:
+globally via config ordering (auth.order)
+per-session via /model ...@<profileId>
+Example (session override):
+/model Opus@anthropic:work
+How to see what profile IDs exist:
+openclaw channels list --json (shows auth[])
+Related docs:
+/concepts/model-failover (rotation + cooldown rules)
+/tools/slash-commands (command surface)

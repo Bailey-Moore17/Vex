@@ -1,0 +1,608 @@
+Chat Channels
+OpenClaw can talk to you on any chat app you already use. Each channel connects via the Gateway. Text is supported everywhere; media and reactions vary by channel.
+​
+Supported channels
+BlueBubbles — Recommended for iMessage; uses the BlueBubbles macOS server REST API with full feature support (edit, unsend, effects, reactions, group management — edit currently broken on macOS 26 Tahoe).
+Discord — Discord Bot API + Gateway; supports servers, channels, and DMs.
+Feishu — Feishu/Lark bot via WebSocket (plugin, installed separately).
+Google Chat — Google Chat API app via HTTP webhook.
+iMessage (legacy) — Legacy macOS integration via imsg CLI (deprecated, use BlueBubbles for new setups).
+IRC — Classic IRC servers; channels + DMs with pairing/allowlist controls.
+LINE — LINE Messaging API bot (plugin, installed separately).
+Matrix — Matrix protocol (plugin, installed separately).
+Mattermost — Bot API + WebSocket; channels, groups, DMs (plugin, installed separately).
+Microsoft Teams — Bot Framework; enterprise support (plugin, installed separately).
+Nextcloud Talk — Self-hosted chat via Nextcloud Talk (plugin, installed separately).
+Nostr — Decentralized DMs via NIP-04 (plugin, installed separately).
+Signal — signal-cli; privacy-focused.
+Synology Chat — Synology NAS Chat via outgoing+incoming webhooks (plugin, installed separately).
+Slack — Bolt SDK; workspace apps.
+Telegram — Bot API via grammY; supports groups.
+Tlon — Urbit-based messenger (plugin, installed separately).
+Twitch — Twitch chat via IRC connection (plugin, installed separately).
+WebChat — Gateway WebChat UI over WebSocket.
+WhatsApp — Most popular; uses Baileys and requires QR pairing.
+Zalo — Zalo Bot API; Vietnam’s popular messenger (plugin, installed separately).
+Zalo Personal — Zalo personal account via QR login (plugin, installed separately).
+​
+Notes
+Channels can run simultaneously; configure multiple and OpenClaw will route per chat.
+Fastest setup is usually Telegram (simple bot token). WhatsApp requires QR pairing and stores more state on disk.
+Group behavior varies by channel; see Groups.
+DM pairing and allowlists are enforced for safety; see Security.
+Troubleshooting: Channel troubleshooting.
+Model providers are documented separately; see Model Providers.
+
+
+Discord
+Status: ready for DMs and guild channels via the official Discord gateway.
+Pairing
+Discord DMs default to pairing mode.
+Slash commands
+Native command behavior and command catalog.
+Channel troubleshooting
+Cross-channel diagnostics and repair flow.
+​
+Quick setup
+You will need to create a new application with a bot, add the bot to your server, and pair it to OpenClaw. We recommend adding your bot to your own private server. If you don’t have one yet, create one first (choose Create My Own > For me and my friends).
+1
+Create a Discord application and bot
+
+Go to the Discord Developer Portal and click New Application. Name it something like “OpenClaw”.
+Click Bot on the sidebar. Set the Username to whatever you call your OpenClaw agent.
+2
+Enable privileged intents
+
+Still on the Bot page, scroll down to Privileged Gateway Intents and enable:
+Message Content Intent (required)
+Server Members Intent (recommended; required for role allowlists and name-to-ID matching)
+Presence Intent (optional; only needed for presence updates)
+3
+Copy your bot token
+
+Scroll back up on the Bot page and click Reset Token.
+Despite the name, this generates your first token — nothing is being “reset.”
+Copy the token and save it somewhere. This is your Bot Token and you will need it shortly.
+4
+Generate an invite URL and add the bot to your server
+
+Click OAuth2 on the sidebar. You’ll generate an invite URL with the right permissions to add the bot to your server.
+Scroll down to OAuth2 URL Generator and enable:
+bot
+applications.commands
+A Bot Permissions section will appear below. Enable:
+View Channels
+Send Messages
+Read Message History
+Embed Links
+Attach Files
+Add Reactions (optional)
+Copy the generated URL at the bottom, paste it into your browser, select your server, and click Continue to connect. You should now see your bot in the Discord server.
+5
+Enable Developer Mode and collect your IDs
+
+Back in the Discord app, you need to enable Developer Mode so you can copy internal IDs.
+Click User Settings (gear icon next to your avatar) → Advanced → toggle on Developer Mode
+Right-click your server icon in the sidebar → Copy Server ID
+Right-click your own avatar → Copy User ID
+Save your Server ID and User ID alongside your Bot Token — you’ll send all three to OpenClaw in the next step.
+6
+Allow DMs from server members
+
+For pairing to work, Discord needs to allow your bot to DM you. Right-click your server icon → Privacy Settings → toggle on Direct Messages.
+This lets server members (including bots) send you DMs. Keep this enabled if you want to use Discord DMs with OpenClaw. If you only plan to use guild channels, you can disable DMs after pairing.
+7
+Step 0: Set your bot token securely (do not send it in chat)
+
+Your Discord bot token is a secret (like a password). Set it on the machine running OpenClaw before messaging your agent.
+export DISCORD_BOT_TOKEN="YOUR_BOT_TOKEN"
+openclaw config set channels.discord.token --ref-provider default --ref-source env --ref-id DISCORD_BOT_TOKEN --dry-run
+openclaw config set channels.discord.token --ref-provider default --ref-source env --ref-id DISCORD_BOT_TOKEN
+openclaw config set channels.discord.enabled true --strict-json
+openclaw gateway
+If OpenClaw is already running as a background service, use openclaw gateway restart instead.
+8
+Configure OpenClaw and pair
+
+Ask your agent
+CLI / config
+Chat with your OpenClaw agent on any existing channel (e.g. Telegram) and tell it. If Discord is your first channel, use the CLI / config tab instead.
+“I already set my Discord bot token in config. Please finish Discord setup with User ID <user_id> and Server ID <server_id>.”
+9
+Approve first DM pairing
+
+Wait until the gateway is running, then DM your bot in Discord. It will respond with a pairing code.
+Ask your agent
+CLI
+Send the pairing code to your agent on your existing channel:
+“Approve this Discord pairing code: <CODE>”
+Pairing codes expire after 1 hour.
+You should now be able to chat with your agent in Discord via DM.
+Token resolution is account-aware. Config token values win over env fallback. DISCORD_BOT_TOKEN is only used for the default account. For advanced outbound calls (message tool/channel actions), an explicit per-call token is used for that call. This applies to send and read/probe-style actions (for example read/search/fetch/thread/pins/permissions). Account policy/retry settings still come from the selected account in the active runtime snapshot.
+​
+Recommended: Set up a guild workspace
+Once DMs are working, you can set up your Discord server as a full workspace where each channel gets its own agent session with its own context. This is recommended for private servers where it’s just you and your bot.
+1
+Add your server to the guild allowlist
+
+This enables your agent to respond in any channel on your server, not just DMs.
+Ask your agent
+Config
+“Add my Discord Server ID <server_id> to the guild allowlist”
+2
+Allow responses without @mention
+
+By default, your agent only responds in guild channels when @mentioned. For a private server, you probably want it to respond to every message.
+Ask your agent
+Config
+“Allow my agent to respond on this server without having to be @mentioned”
+3
+Plan for memory in guild channels
+
+By default, long-term memory (MEMORY.md) only loads in DM sessions. Guild channels do not auto-load MEMORY.md.
+Ask your agent
+Manual
+“When I ask questions in Discord channels, use memory_search or memory_get if you need long-term context from MEMORY.md.”
+Now create some channels on your Discord server and start chatting. Your agent can see the channel name, and each channel gets its own isolated session — so you can set up #coding, #home, #research, or whatever fits your workflow.
+​
+Runtime model
+Gateway owns the Discord connection.
+Reply routing is deterministic: Discord inbound replies back to Discord.
+By default (session.dmScope=main), direct chats share the agent main session (agent:main:main).
+Guild channels are isolated session keys (agent:<agentId>:discord:channel:<channelId>).
+Group DMs are ignored by default (channels.discord.dm.groupEnabled=false).
+Native slash commands run in isolated command sessions (agent:<agentId>:discord:slash:<userId>), while still carrying CommandTargetSessionKey to the routed conversation session.
+​
+Forum channels
+Discord forum and media channels only accept thread posts. OpenClaw supports two ways to create them:
+Send a message to the forum parent (channel:<forumId>) to auto-create a thread. The thread title uses the first non-empty line of your message.
+Use openclaw message thread create to create a thread directly. Do not pass --message-id for forum channels.
+Example: send to forum parent to create a thread
+openclaw message send --channel discord --target channel:<forumId> \
+  --message "Topic title\nBody of the post"
+Example: create a forum thread explicitly
+openclaw message thread create --channel discord --target channel:<forumId> \
+  --thread-name "Topic title" --message "Body of the post"
+Forum parents do not accept Discord components. If you need components, send to the thread itself (channel:<threadId>).
+​
+Interactive components
+OpenClaw supports Discord components v2 containers for agent messages. Use the message tool with a components payload. Interaction results are routed back to the agent as normal inbound messages and follow the existing Discord replyToMode settings.
+Supported blocks:
+text, section, separator, actions, media-gallery, file
+Action rows allow up to 5 buttons or a single select menu
+Select types: string, user, role, mentionable, channel
+By default, components are single use. Set components.reusable=true to allow buttons, selects, and forms to be used multiple times until they expire.
+To restrict who can click a button, set allowedUsers on that button (Discord user IDs, tags, or *). When configured, unmatched users receive an ephemeral denial.
+The /model and /models slash commands open an interactive model picker with provider and model dropdowns plus a Submit step. The picker reply is ephemeral and only the invoking user can use it.
+File attachments:
+file blocks must point to an attachment reference (attachment://<filename>)
+Provide the attachment via media/path/filePath (single file); use media-gallery for multiple files
+Use filename to override the upload name when it should match the attachment reference
+Modal forms:
+Add components.modal with up to 5 fields
+Field types: text, checkbox, radio, select, role-select, user-select
+OpenClaw adds a trigger button automatically
+Example:
+{
+  channel: "discord",
+  action: "send",
+  to: "channel:123456789012345678",
+  message: "Optional fallback text",
+  components: {
+    reusable: true,
+    text: "Choose a path",
+    blocks: [
+      {
+        type: "actions",
+        buttons: [
+          {
+            label: "Approve",
+            style: "success",
+            allowedUsers: ["123456789012345678"],
+          },
+          { label: "Decline", style: "danger" },
+        ],
+      },
+      {
+        type: "actions",
+        select: {
+          type: "string",
+          placeholder: "Pick an option",
+          options: [
+            { label: "Option A", value: "a" },
+            { label: "Option B", value: "b" },
+          ],
+        },
+      },
+    ],
+    modal: {
+      title: "Details",
+      triggerLabel: "Open form",
+      fields: [
+        { type: "text", label: "Requester" },
+        {
+          type: "select",
+          label: "Priority",
+          options: [
+            { label: "Low", value: "low" },
+            { label: "High", value: "high" },
+          ],
+        },
+      ],
+    },
+  },
+}
+​
+Access control and routing
+DM policy
+Guild policy
+Mentions and group DMs
+channels.discord.dmPolicy controls DM access (legacy: channels.discord.dm.policy):
+pairing (default)
+allowlist
+open (requires channels.discord.allowFrom to include "*"; legacy: channels.discord.dm.allowFrom)
+disabled
+If DM policy is not open, unknown users are blocked (or prompted for pairing in pairing mode).
+Multi-account precedence:
+channels.discord.accounts.default.allowFrom applies only to the default account.
+Named accounts inherit channels.discord.allowFrom when their own allowFrom is unset.
+Named accounts do not inherit channels.discord.accounts.default.allowFrom.
+DM target format for delivery:
+user:<id>
+<@id> mention
+Bare numeric IDs are ambiguous and rejected unless an explicit user/channel target kind is provided.
+​
+Role-based agent routing
+Use bindings[].match.roles to route Discord guild members to different agents by role ID. Role-based bindings accept role IDs only and are evaluated after peer or parent-peer bindings and before guild-only bindings. If a binding also sets other match fields (for example peer + guildId + roles), all configured fields must match.
+{
+  bindings: [
+    {
+      agentId: "opus",
+      match: {
+        channel: "discord",
+        guildId: "123456789012345678",
+        roles: ["111111111111111111"],
+      },
+    },
+    {
+      agentId: "sonnet",
+      match: {
+        channel: "discord",
+        guildId: "123456789012345678",
+      },
+    },
+  ],
+}
+​
+Developer Portal setup
+Create app and bot
+
+Privileged intents
+
+OAuth scopes and baseline permissions
+
+Copy IDs
+
+​
+Native commands and command auth
+commands.native defaults to "auto" and is enabled for Discord.
+Per-channel override: channels.discord.commands.native.
+commands.native=false explicitly clears previously registered Discord native commands.
+Native command auth uses the same Discord allowlists/policies as normal message handling.
+Commands may still be visible in Discord UI for users who are not authorized; execution still enforces OpenClaw auth and returns “not authorized”.
+See Slash commands for command catalog and behavior.
+Default slash command settings:
+ephemeral: true
+​
+Feature details
+Reply tags and native replies
+
+Live stream preview
+
+History, context, and thread behavior
+
+Thread-bound sessions for subagents
+
+Persistent ACP channel bindings
+
+Reaction notifications
+
+Ack reactions
+
+Config writes
+
+Gateway proxy
+
+PluralKit support
+
+Presence configuration
+
+Exec approvals in Discord
+
+​
+Tools and action gates
+Discord message actions include messaging, channel admin, moderation, presence, and metadata actions.
+Core examples:
+messaging: sendMessage, readMessages, editMessage, deleteMessage, threadReply
+reactions: react, reactions, emojiList
+moderation: timeout, kick, ban
+presence: setPresence
+Action gates live under channels.discord.actions.*.
+Default gate behavior:
+Action group	Default
+reactions, messages, threads, pins, polls, search, memberInfo, roleInfo, channelInfo, channels, voiceStatus, events, stickers, emojiUploads, stickerUploads, permissions	enabled
+roles	disabled
+moderation	disabled
+presence	disabled
+​
+Components v2 UI
+OpenClaw uses Discord components v2 for exec approvals and cross-context markers. Discord message actions can also accept components for custom UI (advanced; requires Carbon component instances), while legacy embeds remain available but are not recommended.
+channels.discord.ui.components.accentColor sets the accent color used by Discord component containers (hex).
+Set per account with channels.discord.accounts.<id>.ui.components.accentColor.
+embeds are ignored when components v2 are present.
+Example:
+{
+  channels: {
+    discord: {
+      ui: {
+        components: {
+          accentColor: "#5865F2",
+        },
+      },
+    },
+  },
+}
+​
+Voice channels
+OpenClaw can join Discord voice channels for realtime, continuous conversations. This is separate from voice message attachments.
+Requirements:
+Enable native commands (commands.native or channels.discord.commands.native).
+Configure channels.discord.voice.
+The bot needs Connect + Speak permissions in the target voice channel.
+Use the Discord-only native command /vc join|leave|status to control sessions. The command uses the account default agent and follows the same allowlist and group policy rules as other Discord commands.
+Auto-join example:
+{
+  channels: {
+    discord: {
+      voice: {
+        enabled: true,
+        autoJoin: [
+          {
+            guildId: "123456789012345678",
+            channelId: "234567890123456789",
+          },
+        ],
+        daveEncryption: true,
+        decryptionFailureTolerance: 24,
+        tts: {
+          provider: "openai",
+          openai: { voice: "alloy" },
+        },
+      },
+    },
+  },
+}
+Notes:
+voice.tts overrides messages.tts for voice playback only.
+Voice transcript turns derive owner status from Discord allowFrom (or dm.allowFrom); non-owner speakers cannot access owner-only tools (for example gateway and cron).
+Voice is enabled by default; set channels.discord.voice.enabled=false to disable it.
+voice.daveEncryption and voice.decryptionFailureTolerance pass through to @discordjs/voice join options.
+@discordjs/voice defaults are daveEncryption=true and decryptionFailureTolerance=24 if unset.
+OpenClaw also watches receive decrypt failures and auto-recovers by leaving/rejoining the voice channel after repeated failures in a short window.
+If receive logs repeatedly show DecryptionFailed(UnencryptedWhenPassthroughDisabled), this may be the upstream @discordjs/voice receive bug tracked in discord.js #11419.
+​
+Voice messages
+Discord voice messages show a waveform preview and require OGG/Opus audio plus metadata. OpenClaw generates the waveform automatically, but it needs ffmpeg and ffprobe available on the gateway host to inspect and convert audio files.
+Requirements and constraints:
+Provide a local file path (URLs are rejected).
+Omit text content (Discord does not allow text + voice message in the same payload).
+Any audio format is accepted; OpenClaw converts to OGG/Opus when needed.
+Example:
+message(action="send", channel="discord", target="channel:123", path="/path/to/audio.mp3", asVoice=true)
+​
+Troubleshooting
+Used disallowed intents or bot sees no guild messages
+
+Guild messages blocked unexpectedly
+
+Require mention false but still blocked
+
+Long-running handlers time out or duplicate replies
+
+Permissions audit mismatches
+
+DM and pairing issues
+
+Bot to bot loops
+
+Voice STT drops with DecryptionFailed(...)
+
+​
+Configuration reference pointers
+Primary reference:
+Configuration reference - Discord
+High-signal Discord fields:
+startup/auth: enabled, token, accounts.*, allowBots
+policy: groupPolicy, dm.*, guilds.*, guilds.*.channels.*
+command: commands.native, commands.useAccessGroups, configWrites, slashCommand.*
+event queue: eventQueue.listenerTimeout (listener budget), eventQueue.maxQueueSize, eventQueue.maxConcurrency
+inbound worker: inboundWorker.runTimeoutMs
+reply/history: replyToMode, historyLimit, dmHistoryLimit, dms.*.historyLimit
+delivery: textChunkLimit, chunkMode, maxLinesPerMessage
+streaming: streaming (legacy alias: streamMode), draftChunk, blockStreaming, blockStreamingCoalesce
+media/retry: mediaMaxMb, retry
+mediaMaxMb caps outbound Discord uploads (default: 8MB)
+actions: actions.*
+presence: activity, status, activityType, activityUrl
+UI: ui.components.accentColor
+features: threadBindings, top-level bindings[] (type: "acp"), pluralkit, execApprovals, intents, agentComponents, heartbeat, responsePrefix
+​
+Safety and operations
+Treat bot tokens as secrets (DISCORD_BOT_TOKEN preferred in supervised environments).
+Grant least-privilege Discord permissions.
+If command deploy/state is stale, restart gateway and re-check with openclaw channels status --probe.
+​
+Related
+Pairing
+Channel routing
+Multi-agent routing
+Troubleshooting
+Slash commands
+
+
+Pairing
+“Pairing” is OpenClaw’s explicit owner approval step. It is used in two places:
+DM pairing (who is allowed to talk to the bot)
+Node pairing (which devices/nodes are allowed to join the gateway network)
+Security context: Security
+​
+1) DM pairing (inbound chat access)
+When a channel is configured with DM policy pairing, unknown senders get a short code and their message is not processed until you approve.
+Default DM policies are documented in: Security
+Pairing codes:
+8 characters, uppercase, no ambiguous chars (0O1I).
+Expire after 1 hour. The bot only sends the pairing message when a new request is created (roughly once per hour per sender).
+Pending DM pairing requests are capped at 3 per channel by default; additional requests are ignored until one expires or is approved.
+​
+Approve a sender
+openclaw pairing list telegram
+openclaw pairing approve telegram <CODE>
+Supported channels: telegram, whatsapp, signal, imessage, discord, slack, feishu.
+​
+Where the state lives
+Stored under ~/.openclaw/credentials/:
+Pending requests: <channel>-pairing.json
+Approved allowlist store:
+Default account: <channel>-allowFrom.json
+Non-default account: <channel>-<accountId>-allowFrom.json
+Account scoping behavior:
+Non-default accounts read/write only their scoped allowlist file.
+Default account uses the channel-scoped unscoped allowlist file.
+Treat these as sensitive (they gate access to your assistant).
+​
+2) Node device pairing (iOS/Android/macOS/headless nodes)
+Nodes connect to the Gateway as devices with role: node. The Gateway creates a device pairing request that must be approved.
+​
+Pair via Telegram (recommended for iOS)
+If you use the device-pair plugin, you can do first-time device pairing entirely from Telegram:
+In Telegram, message your bot: /pair
+The bot replies with two messages: an instruction message and a separate setup code message (easy to copy/paste in Telegram).
+On your phone, open the OpenClaw iOS app → Settings → Gateway.
+Paste the setup code and connect.
+Back in Telegram: /pair approve
+The setup code is a base64-encoded JSON payload that contains:
+url: the Gateway WebSocket URL (ws://... or wss://...)
+bootstrapToken: a short-lived single-device bootstrap token used for the initial pairing handshake
+Treat the setup code like a password while it is valid.
+​
+Approve a node device
+openclaw devices list
+openclaw devices approve <requestId>
+openclaw devices reject <requestId>
+​
+Node pairing state storage
+Stored under ~/.openclaw/devices/:
+pending.json (short-lived; pending requests expire)
+paired.json (paired devices + tokens)
+​
+Notes
+The legacy node.pair.* API (CLI: openclaw nodes pending/approve) is a separate gateway-owned pairing store. WS nodes still require device pairing.
+​
+Related docs
+Security model + prompt injection: Security
+Updating safely (run doctor): Updating
+Channel configs:
+Telegram: Telegram
+WhatsApp: WhatsApp
+Signal: Signal
+BlueBubbles (iMessage): BlueBubbles
+iMessage (legacy): iMessage
+Discord: Discord
+Slack: Slack
+
+
+
+
+
+Configuration
+Channel Troubleshooting
+Use this page when a channel connects but behavior is wrong.
+​
+Command ladder
+Run these in order first:
+openclaw status
+openclaw gateway status
+openclaw logs --follow
+openclaw doctor
+openclaw channels status --probe
+Healthy baseline:
+Runtime: running
+RPC probe: ok
+Channel probe shows connected/ready
+​
+WhatsApp
+​
+WhatsApp failure signatures
+Symptom	Fastest check	Fix
+Connected but no DM replies	openclaw pairing list whatsapp	Approve sender or switch DM policy/allowlist.
+Group messages ignored	Check requireMention + mention patterns in config	Mention the bot or relax mention policy for that group.
+Random disconnect/relogin loops	openclaw channels status --probe + logs	Re-login and verify credentials directory is healthy.
+Full troubleshooting: /channels/whatsapp#troubleshooting-quick
+​
+Telegram
+​
+Telegram failure signatures
+Symptom	Fastest check	Fix
+/start but no usable reply flow	openclaw pairing list telegram	Approve pairing or change DM policy.
+Bot online but group stays silent	Verify mention requirement and bot privacy mode	Disable privacy mode for group visibility or mention bot.
+Send failures with network errors	Inspect logs for Telegram API call failures	Fix DNS/IPv6/proxy routing to api.telegram.org.
+setMyCommands rejected at startup	Inspect logs for BOT_COMMANDS_TOO_MUCH	Reduce plugin/skill/custom Telegram commands or disable native menus.
+Upgraded and allowlist blocks you	openclaw security audit and config allowlists	Run openclaw doctor --fix or replace @username with numeric sender IDs.
+Full troubleshooting: /channels/telegram#troubleshooting
+​
+Discord
+​
+Discord failure signatures
+Symptom	Fastest check	Fix
+Bot online but no guild replies	openclaw channels status --probe	Allow guild/channel and verify message content intent.
+Group messages ignored	Check logs for mention gating drops	Mention bot or set guild/channel requireMention: false.
+DM replies missing	openclaw pairing list discord	Approve DM pairing or adjust DM policy.
+Full troubleshooting: /channels/discord#troubleshooting
+​
+Slack
+​
+Slack failure signatures
+Symptom	Fastest check	Fix
+Socket mode connected but no responses	openclaw channels status --probe	Verify app token + bot token and required scopes.
+DMs blocked	openclaw pairing list slack	Approve pairing or relax DM policy.
+Channel message ignored	Check groupPolicy and channel allowlist	Allow the channel or switch policy to open.
+Full troubleshooting: /channels/slack#troubleshooting
+​
+iMessage and BlueBubbles
+​
+iMessage and BlueBubbles failure signatures
+Symptom	Fastest check	Fix
+No inbound events	Verify webhook/server reachability and app permissions	Fix webhook URL or BlueBubbles server state.
+Can send but no receive on macOS	Check macOS privacy permissions for Messages automation	Re-grant TCC permissions and restart channel process.
+DM sender blocked	openclaw pairing list imessage or openclaw pairing list bluebubbles	Approve pairing or update allowlist.
+Full troubleshooting:
+/channels/imessage#troubleshooting-macos-privacy-and-security-tcc
+/channels/bluebubbles#troubleshooting
+​
+Signal
+​
+Signal failure signatures
+Symptom	Fastest check	Fix
+Daemon reachable but bot silent	openclaw channels status --probe	Verify signal-cli daemon URL/account and receive mode.
+DM blocked	openclaw pairing list signal	Approve sender or adjust DM policy.
+Group replies do not trigger	Check group allowlist and mention patterns	Add sender/group or loosen gating.
+Full troubleshooting: /channels/signal#troubleshooting
+​
+Matrix
+​
+Matrix failure signatures
+Symptom	Fastest check	Fix
+Logged in but ignores room messages	openclaw channels status --probe	Check groupPolicy and room allowlist.
+DMs do not process	openclaw pairing list matrix	Approve sender or adjust DM policy.
+Encrypted rooms fail	Verify crypto module and encryption settings	Enable encryption support and rejoin/sync room.
+Full troubleshooting: /channels/matrix#troubleshooting

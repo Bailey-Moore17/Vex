@@ -1,0 +1,887 @@
+Skills
+Creating Skills
+OpenClaw is designed to be easily extensible. “Skills” are the primary way to add new capabilities to your assistant.
+​
+What is a Skill?
+A skill is a directory containing a SKILL.md file (which provides instructions and tool definitions to the LLM) and optionally some scripts or resources.
+​
+Step-by-Step: Your First Skill
+​
+1. Create the Directory
+Skills live in your workspace, usually ~/.openclaw/workspace/skills/. Create a new folder for your skill:
+mkdir -p ~/.openclaw/workspace/skills/hello-world
+​
+2. Define the SKILL.md
+Create a SKILL.md file in that directory. This file uses YAML frontmatter for metadata and Markdown for instructions.
+---
+name: hello_world
+description: A simple skill that says hello.
+---
+
+# Hello World Skill
+
+When the user asks for a greeting, use the `echo` tool to say "Hello from your custom skill!".
+​
+3. Add Tools (Optional)
+You can define custom tools in the frontmatter or instruct the agent to use existing system tools (like bash or browser).
+​
+4. Refresh OpenClaw
+Ask your agent to “refresh skills” or restart the gateway. OpenClaw will discover the new directory and index the SKILL.md.
+​
+Best Practices
+Be Concise: Instruct the model on what to do, not how to be an AI.
+Safety First: If your skill uses bash, ensure the prompts don’t allow arbitrary command injection from untrusted user input.
+Test Locally: Use openclaw agent --message "use my new skill" to test.
+​
+Shared Skills
+You can also browse and contribute skills to ClawHub.
+
+
+Skills
+Slash Commands
+Commands are handled by the Gateway. Most commands must be sent as a standalone message that starts with /. The host-only bash chat command uses ! <cmd> (with /bash <cmd> as an alias).
+There are two related systems:
+Commands: standalone /... messages.
+Directives: /think, /fast, /verbose, /reasoning, /elevated, /exec, /model, /queue.
+Directives are stripped from the message before the model sees it.
+In normal chat messages (not directive-only), they are treated as “inline hints” and do not persist session settings.
+In directive-only messages (the message contains only directives), they persist to the session and reply with an acknowledgement.
+Directives are only applied for authorized senders. If commands.allowFrom is set, it is the only allowlist used; otherwise authorization comes from channel allowlists/pairing plus commands.useAccessGroups. Unauthorized senders see directives treated as plain text.
+There are also a few inline shortcuts (allowlisted/authorized senders only): /help, /commands, /status, /whoami (/id). They run immediately, are stripped before the model sees the message, and the remaining text continues through the normal flow.
+​
+Config
+{
+  commands: {
+    native: "auto",
+    nativeSkills: "auto",
+    text: true,
+    bash: false,
+    bashForegroundMs: 2000,
+    config: false,
+    mcp: false,
+    plugins: false,
+    debug: false,
+    restart: false,
+    allowFrom: {
+      "*": ["user1"],
+      discord: ["user:123"],
+    },
+    useAccessGroups: true,
+  },
+}
+commands.text (default true) enables parsing /... in chat messages.
+On surfaces without native commands (WhatsApp/WebChat/Signal/iMessage/Google Chat/MS Teams), text commands still work even if you set this to false.
+commands.native (default "auto") registers native commands.
+Auto: on for Discord/Telegram; off for Slack (until you add slash commands); ignored for providers without native support.
+Set channels.discord.commands.native, channels.telegram.commands.native, or channels.slack.commands.native to override per provider (bool or "auto").
+false clears previously registered commands on Discord/Telegram at startup. Slack commands are managed in the Slack app and are not removed automatically.
+commands.nativeSkills (default "auto") registers skill commands natively when supported.
+Auto: on for Discord/Telegram; off for Slack (Slack requires creating a slash command per skill).
+Set channels.discord.commands.nativeSkills, channels.telegram.commands.nativeSkills, or channels.slack.commands.nativeSkills to override per provider (bool or "auto").
+commands.bash (default false) enables ! <cmd> to run host shell commands (/bash <cmd> is an alias; requires tools.elevated allowlists).
+commands.bashForegroundMs (default 2000) controls how long bash waits before switching to background mode (0 backgrounds immediately).
+commands.config (default false) enables /config (reads/writes openclaw.json).
+commands.mcp (default false) enables /mcp (reads/writes OpenClaw-managed MCP config under mcp.servers).
+commands.plugins (default false) enables /plugins (plugin discovery/status plus enable/disable toggles).
+commands.debug (default false) enables /debug (runtime-only overrides).
+commands.allowFrom (optional) sets a per-provider allowlist for command authorization. When configured, it is the only authorization source for commands and directives (channel allowlists/pairing and commands.useAccessGroups are ignored). Use "*" for a global default; provider-specific keys override it.
+commands.useAccessGroups (default true) enforces allowlists/policies for commands when commands.allowFrom is not set.
+​
+Command list
+Text + native (when enabled):
+/help
+/commands
+/skill <name> [input] (run a skill by name)
+/status (show current status; includes provider usage/quota for the current model provider when available)
+/allowlist (list/add/remove allowlist entries)
+/approve <id> allow-once|allow-always|deny (resolve exec approval prompts)
+/context [list|detail|json] (explain “context”; detail shows per-file + per-tool + per-skill + system prompt size)
+/btw <question> (ask an ephemeral side question about the current session without changing future session context; see /tools/btw)
+/export-session [path] (alias: /export) (export current session to HTML with full system prompt)
+/whoami (show your sender id; alias: /id)
+/session idle <duration|off> (manage inactivity auto-unfocus for focused thread bindings)
+/session max-age <duration|off> (manage hard max-age auto-unfocus for focused thread bindings)
+/subagents list|kill|log|info|send|steer|spawn (inspect, control, or spawn sub-agent runs for the current session)
+/acp spawn|cancel|steer|close|status|set-mode|set|cwd|permissions|timeout|model|reset-options|doctor|install|sessions (inspect and control ACP runtime sessions)
+/agents (list thread-bound agents for this session)
+/focus <target> (Discord: bind this thread, or a new thread, to a session/subagent target)
+/unfocus (Discord: remove the current thread binding)
+/kill <id|#|all> (immediately abort one or all running sub-agents for this session; no confirmation message)
+/steer <id|#> <message> (steer a running sub-agent immediately: in-run when possible, otherwise abort current work and restart on the steer message)
+/tell <id|#> <message> (alias for /steer)
+/config show|get|set|unset (persist config to disk, owner-only; requires commands.config: true)
+/mcp show|get|set|unset (manage OpenClaw MCP server config, owner-only; requires commands.mcp: true)
+/plugins list|show|get|enable|disable (inspect discovered plugins and toggle enablement, owner-only for writes; requires commands.plugins: true)
+/debug show|set|unset|reset (runtime overrides, owner-only; requires commands.debug: true)
+/usage off|tokens|full|cost (per-response usage footer or local cost summary)
+/tts off|always|inbound|tagged|status|provider|limit|summary|audio (control TTS; see /tts)
+Discord: native command is /voice (Discord reserves /tts); text /tts still works.
+/stop
+/restart
+/dock-telegram (alias: /dock_telegram) (switch replies to Telegram)
+/dock-discord (alias: /dock_discord) (switch replies to Discord)
+/dock-slack (alias: /dock_slack) (switch replies to Slack)
+/activation mention|always (groups only)
+/send on|off|inherit (owner-only)
+/reset or /new [model] (optional model hint; remainder is passed through)
+/think <off|minimal|low|medium|high|xhigh> (dynamic choices by model/provider; aliases: /thinking, /t)
+/fast status|on|off (omitting the arg shows the current effective fast-mode state)
+/verbose on|full|off (alias: /v)
+/reasoning on|off|stream (alias: /reason; when on, sends a separate message prefixed Reasoning:; stream = Telegram draft only)
+/elevated on|off|ask|full (alias: /elev; full skips exec approvals)
+/exec host=<sandbox|gateway|node> security=<deny|allowlist|full> ask=<off|on-miss|always> node=<id> (send /exec to show current)
+/model <name> (alias: /models; or /<alias> from agents.defaults.models.*.alias)
+/queue <mode> (plus options like debounce:2s cap:25 drop:summarize; send /queue to see current settings)
+/bash <command> (host-only; alias for ! <command>; requires commands.bash: true + tools.elevated allowlists)
+Text-only:
+/compact [instructions] (see /concepts/compaction)
+! <command> (host-only; one at a time; use !poll + !stop for long-running jobs)
+!poll (check output / status; accepts optional sessionId; /bash poll also works)
+!stop (stop the running bash job; accepts optional sessionId; /bash stop also works)
+Notes:
+Commands accept an optional : between the command and args (e.g. /think: high, /send: on, /help:).
+/new <model> accepts a model alias, provider/model, or a provider name (fuzzy match); if no match, the text is treated as the message body.
+For full provider usage breakdown, use openclaw status --usage.
+/allowlist add|remove requires commands.config=true and honors channel configWrites.
+In multi-account channels, config-targeted /allowlist --account <id> and /config set channels.<provider>.accounts.<id>... also honor the target account’s configWrites.
+/usage controls the per-response usage footer; /usage cost prints a local cost summary from OpenClaw session logs.
+/restart is enabled by default; set commands.restart: false to disable it.
+Discord-only native command: /vc join|leave|status controls voice channels (requires channels.discord.voice and native commands; not available as text).
+Discord thread-binding commands (/focus, /unfocus, /agents, /session idle, /session max-age) require effective thread bindings to be enabled (session.threadBindings.enabled and/or channels.discord.threadBindings.enabled).
+ACP command reference and runtime behavior: ACP Agents.
+/verbose is meant for debugging and extra visibility; keep it off in normal use.
+/fast on|off persists a session override. Use the Sessions UI inherit option to clear it and fall back to config defaults.
+Tool failure summaries are still shown when relevant, but detailed failure text is only included when /verbose is on or full.
+/reasoning (and /verbose) are risky in group settings: they may reveal internal reasoning or tool output you did not intend to expose. Prefer leaving them off, especially in group chats.
+Fast path: command-only messages from allowlisted senders are handled immediately (bypass queue + model).
+Group mention gating: command-only messages from allowlisted senders bypass mention requirements.
+Inline shortcuts (allowlisted senders only): certain commands also work when embedded in a normal message and are stripped before the model sees the remaining text.
+Example: hey /status triggers a status reply, and the remaining text continues through the normal flow.
+Currently: /help, /commands, /status, /whoami (/id).
+Unauthorized command-only messages are silently ignored, and inline /... tokens are treated as plain text.
+Skill commands: user-invocable skills are exposed as slash commands. Names are sanitized to a-z0-9_ (max 32 chars); collisions get numeric suffixes (e.g. _2).
+/skill <name> [input] runs a skill by name (useful when native command limits prevent per-skill commands).
+By default, skill commands are forwarded to the model as a normal request.
+Skills may optionally declare command-dispatch: tool to route the command directly to a tool (deterministic, no model).
+Example: /prose (OpenProse plugin) — see OpenProse.
+Native command arguments: Discord uses autocomplete for dynamic options (and button menus when you omit required args). Telegram and Slack show a button menu when a command supports choices and you omit the arg.
+​
+Usage surfaces (what shows where)
+Provider usage/quota (example: “Claude 80% left”) shows up in /status for the current model provider when usage tracking is enabled.
+Per-response tokens/cost is controlled by /usage off|tokens|full (appended to normal replies).
+/model status is about models/auth/endpoints, not usage.
+​
+Model selection (/model)
+/model is implemented as a directive.
+Examples:
+/model
+/model list
+/model 3
+/model openai/gpt-5.2
+/model opus@anthropic:default
+/model status
+Notes:
+/model and /model list show a compact, numbered picker (model family + available providers).
+On Discord, /model and /models open an interactive picker with provider and model dropdowns plus a Submit step.
+/model <#> selects from that picker (and prefers the current provider when possible).
+/model status shows the detailed view, including configured provider endpoint (baseUrl) and API mode (api) when available.
+​
+Debug overrides
+/debug lets you set runtime-only config overrides (memory, not disk). Owner-only. Disabled by default; enable with commands.debug: true.
+Examples:
+/debug show
+/debug set messages.responsePrefix="[openclaw]"
+/debug set channels.whatsapp.allowFrom=["+1555","+4477"]
+/debug unset messages.responsePrefix
+/debug reset
+Notes:
+Overrides apply immediately to new config reads, but do not write to openclaw.json.
+Use /debug reset to clear all overrides and return to the on-disk config.
+​
+Config updates
+/config writes to your on-disk config (openclaw.json). Owner-only. Disabled by default; enable with commands.config: true.
+Examples:
+/config show
+/config show messages.responsePrefix
+/config get messages.responsePrefix
+/config set messages.responsePrefix="[openclaw]"
+/config unset messages.responsePrefix
+Notes:
+Config is validated before write; invalid changes are rejected.
+/config updates persist across restarts.
+​
+MCP updates
+/mcp writes OpenClaw-managed MCP server definitions under mcp.servers. Owner-only. Disabled by default; enable with commands.mcp: true.
+Examples:
+/mcp show
+/mcp show context7
+/mcp set context7={"command":"uvx","args":["context7-mcp"]}
+/mcp unset context7
+Notes:
+/mcp stores config in OpenClaw config, not Pi-owned project settings.
+Runtime adapters decide which transports are actually executable.
+​
+Plugin updates
+/plugins lets operators inspect discovered plugins and toggle enablement in config. Read-only flows can use /plugin as an alias. Disabled by default; enable with commands.plugins: true.
+Examples:
+/plugins
+/plugins list
+/plugin show context7
+/plugins enable context7
+/plugins disable context7
+Notes:
+/plugins list and /plugins show use real plugin discovery against the current workspace plus on-disk config.
+/plugins enable|disable updates plugin config only; it does not install or uninstall plugins.
+After enable/disable changes, restart the gateway to apply them.
+​
+Surface notes
+Text commands run in the normal chat session (DMs share main, groups have their own session).
+Native commands use isolated sessions:
+Discord: agent:<agentId>:discord:slash:<userId>
+Slack: agent:<agentId>:slack:slash:<userId> (prefix configurable via channels.slack.slashCommand.sessionPrefix)
+Telegram: telegram:slash:<userId> (targets the chat session via CommandTargetSessionKey)
+/stop targets the active chat session so it can abort the current run.
+Slack: channels.slack.slashCommand is still supported for a single /openclaw-style command. If you enable commands.native, you must create one Slack slash command per built-in command (same names as /help). Command argument menus for Slack are delivered as ephemeral Block Kit buttons.
+Slack native exception: register /agentstatus (not /status) because Slack reserves /status. Text /status still works in Slack messages.
+​
+BTW side questions
+/btw is a quick side question about the current session.
+Unlike normal chat:
+it uses the current session as background context,
+it runs as a separate tool-less one-shot call,
+it does not change future session context,
+it is not written to transcript history,
+it is delivered as a live side result instead of a normal assistant message.
+That makes /btw useful when you want a temporary clarification while the main task keeps going.
+Example:
+/btw what are we doing right now?
+See BTW Side Questions for the full behavior and client UX details.
+
+
+
+Skills
+Skills
+OpenClaw uses AgentSkills-compatible skill folders to teach the agent how to use tools. Each skill is a directory containing a SKILL.md with YAML frontmatter and instructions. OpenClaw loads bundled skills plus optional local overrides, and filters them at load time based on environment, config, and binary presence.
+​
+Locations and precedence
+Skills are loaded from three places:
+Bundled skills: shipped with the install (npm package or OpenClaw.app)
+Managed/local skills: ~/.openclaw/skills
+Workspace skills: <workspace>/skills
+If a skill name conflicts, precedence is:
+<workspace>/skills (highest) → ~/.openclaw/skills → bundled skills (lowest)
+Additionally, you can configure extra skill folders (lowest precedence) via skills.load.extraDirs in ~/.openclaw/openclaw.json.
+​
+Per-agent vs shared skills
+In multi-agent setups, each agent has its own workspace. That means:
+Per-agent skills live in <workspace>/skills for that agent only.
+Shared skills live in ~/.openclaw/skills (managed/local) and are visible to all agents on the same machine.
+Shared folders can also be added via skills.load.extraDirs (lowest precedence) if you want a common skills pack used by multiple agents.
+If the same skill name exists in more than one place, the usual precedence applies: workspace wins, then managed/local, then bundled.
+​
+Plugins + skills
+Plugins can ship their own skills by listing skills directories in openclaw.plugin.json (paths relative to the plugin root). Plugin skills load when the plugin is enabled and participate in the normal skill precedence rules. You can gate them via metadata.openclaw.requires.config on the plugin’s config entry. See Plugins for discovery/config and Tools for the tool surface those skills teach.
+​
+ClawHub (install + sync)
+ClawHub is the public skills registry for OpenClaw. Browse at https://clawhub.com. Use it to discover, install, update, and back up skills. Full guide: ClawHub.
+Common flows:
+Install a skill into your workspace:
+clawhub install <skill-slug>
+Update all installed skills:
+clawhub update --all
+Sync (scan + publish updates):
+clawhub sync --all
+By default, clawhub installs into ./skills under your current working directory (or falls back to the configured OpenClaw workspace). OpenClaw picks that up as <workspace>/skills on the next session.
+​
+Security notes
+Treat third-party skills as untrusted code. Read them before enabling.
+Prefer sandboxed runs for untrusted inputs and risky tools. See Sandboxing.
+Workspace and extra-dir skill discovery only accepts skill roots and SKILL.md files whose resolved realpath stays inside the configured root.
+skills.entries.*.env and skills.entries.*.apiKey inject secrets into the host process for that agent turn (not the sandbox). Keep secrets out of prompts and logs.
+For a broader threat model and checklists, see Security.
+​
+Format (AgentSkills + Pi-compatible)
+SKILL.md must include at least:
+---
+name: image-lab
+description: Generate or edit images via a provider-backed image workflow
+---
+Notes:
+We follow the AgentSkills spec for layout/intent.
+The parser used by the embedded agent supports single-line frontmatter keys only.
+metadata should be a single-line JSON object.
+Use {baseDir} in instructions to reference the skill folder path.
+Optional frontmatter keys:
+homepage — URL surfaced as “Website” in the macOS Skills UI (also supported via metadata.openclaw.homepage).
+user-invocable — true|false (default: true). When true, the skill is exposed as a user slash command.
+disable-model-invocation — true|false (default: false). When true, the skill is excluded from the model prompt (still available via user invocation).
+command-dispatch — tool (optional). When set to tool, the slash command bypasses the model and dispatches directly to a tool.
+command-tool — tool name to invoke when command-dispatch: tool is set.
+command-arg-mode — raw (default). For tool dispatch, forwards the raw args string to the tool (no core parsing).
+The tool is invoked with params: { command: "<raw args>", commandName: "<slash command>", skillName: "<skill name>" }.
+​
+Gating (load-time filters)
+OpenClaw filters skills at load time using metadata (single-line JSON):
+---
+name: image-lab
+description: Generate or edit images via a provider-backed image workflow
+metadata:
+  {
+    "openclaw":
+      {
+        "requires": { "bins": ["uv"], "env": ["GEMINI_API_KEY"], "config": ["browser.enabled"] },
+        "primaryEnv": "GEMINI_API_KEY",
+      },
+  }
+---
+Fields under metadata.openclaw:
+always: true — always include the skill (skip other gates).
+emoji — optional emoji used by the macOS Skills UI.
+homepage — optional URL shown as “Website” in the macOS Skills UI.
+os — optional list of platforms (darwin, linux, win32). If set, the skill is only eligible on those OSes.
+requires.bins — list; each must exist on PATH.
+requires.anyBins — list; at least one must exist on PATH.
+requires.env — list; env var must exist or be provided in config.
+requires.config — list of openclaw.json paths that must be truthy.
+primaryEnv — env var name associated with skills.entries.<name>.apiKey.
+install — optional array of installer specs used by the macOS Skills UI (brew/node/go/uv/download).
+Note on sandboxing:
+requires.bins is checked on the host at skill load time.
+If an agent is sandboxed, the binary must also exist inside the container. Install it via agents.defaults.sandbox.docker.setupCommand (or a custom image). setupCommand runs once after the container is created. Package installs also require network egress, a writable root FS, and a root user in the sandbox. Example: the summarize skill (skills/summarize/SKILL.md) needs the summarize CLI in the sandbox container to run there.
+Installer example:
+---
+name: gemini
+description: Use Gemini CLI for coding assistance and Google search lookups.
+metadata:
+  {
+    "openclaw":
+      {
+        "emoji": "♊️",
+        "requires": { "bins": ["gemini"] },
+        "install":
+          [
+            {
+              "id": "brew",
+              "kind": "brew",
+              "formula": "gemini-cli",
+              "bins": ["gemini"],
+              "label": "Install Gemini CLI (brew)",
+            },
+          ],
+      },
+  }
+---
+Notes:
+If multiple installers are listed, the gateway picks a single preferred option (brew when available, otherwise node).
+If all installers are download, OpenClaw lists each entry so you can see the available artifacts.
+Installer specs can include os: ["darwin"|"linux"|"win32"] to filter options by platform.
+Node installs honor skills.install.nodeManager in openclaw.json (default: npm; options: npm/pnpm/yarn/bun). This only affects skill installs; the Gateway runtime should still be Node (Bun is not recommended for WhatsApp/Telegram).
+Go installs: if go is missing and brew is available, the gateway installs Go via Homebrew first and sets GOBIN to Homebrew’s bin when possible.
+Download installs: url (required), archive (tar.gz | tar.bz2 | zip), extract (default: auto when archive detected), stripComponents, targetDir (default: ~/.openclaw/tools/<skillKey>).
+If no metadata.openclaw is present, the skill is always eligible (unless disabled in config or blocked by skills.allowBundled for bundled skills).
+​
+Config overrides (~/.openclaw/openclaw.json)
+Bundled/managed skills can be toggled and supplied with env values:
+{
+  skills: {
+    entries: {
+      "image-lab": {
+        enabled: true,
+        apiKey: { source: "env", provider: "default", id: "GEMINI_API_KEY" }, // or plaintext string
+        env: {
+          GEMINI_API_KEY: "GEMINI_KEY_HERE",
+        },
+        config: {
+          endpoint: "https://example.invalid",
+          model: "nano-pro",
+        },
+      },
+      peekaboo: { enabled: true },
+      sag: { enabled: false },
+    },
+  },
+}
+Note: if the skill name contains hyphens, quote the key (JSON5 allows quoted keys).
+If you want stock image generation/editing inside OpenClaw itself, use the core image_generate tool with agents.defaults.imageGenerationModel instead of a bundled skill. Skill examples here are for custom or third-party workflows.
+Config keys match the skill name by default. If a skill defines metadata.openclaw.skillKey, use that key under skills.entries.
+Rules:
+enabled: false disables the skill even if it’s bundled/installed.
+env: injected only if the variable isn’t already set in the process.
+apiKey: convenience for skills that declare metadata.openclaw.primaryEnv. Supports plaintext string or SecretRef object ({ source, provider, id }).
+config: optional bag for custom per-skill fields; custom keys must live here.
+allowBundled: optional allowlist for bundled skills only. If set, only bundled skills in the list are eligible (managed/workspace skills unaffected).
+​
+Environment injection (per agent run)
+When an agent run starts, OpenClaw:
+Reads skill metadata.
+Applies any skills.entries.<key>.env or skills.entries.<key>.apiKey to process.env.
+Builds the system prompt with eligible skills.
+Restores the original environment after the run ends.
+This is scoped to the agent run, not a global shell environment.
+​
+Session snapshot (performance)
+OpenClaw snapshots the eligible skills when a session starts and reuses that list for subsequent turns in the same session. Changes to skills or config take effect on the next new session.
+Skills can also refresh mid-session when the skills watcher is enabled or when a new eligible remote node appears (see below). Think of this as a hot reload: the refreshed list is picked up on the next agent turn.
+​
+Remote macOS nodes (Linux gateway)
+If the Gateway is running on Linux but a macOS node is connected with system.run allowed (Exec approvals security not set to deny), OpenClaw can treat macOS-only skills as eligible when the required binaries are present on that node. The agent should execute those skills via the nodes tool (typically nodes.run).
+This relies on the node reporting its command support and on a bin probe via system.run. If the macOS node goes offline later, the skills remain visible; invocations may fail until the node reconnects.
+​
+Skills watcher (auto-refresh)
+By default, OpenClaw watches skill folders and bumps the skills snapshot when SKILL.md files change. Configure this under skills.load:
+{
+  skills: {
+    load: {
+      watch: true,
+      watchDebounceMs: 250,
+    },
+  },
+}
+​
+Token impact (skills list)
+When skills are eligible, OpenClaw injects a compact XML list of available skills into the system prompt (via formatSkillsForPrompt in pi-coding-agent). The cost is deterministic:
+Base overhead (only when ≥1 skill): 195 characters.
+Per skill: 97 characters + the length of the XML-escaped <name>, <description>, and <location> values.
+Formula (characters):
+total = 195 + Σ (97 + len(name_escaped) + len(description_escaped) + len(location_escaped))
+Notes:
+XML escaping expands & < > " ' into entities (&amp;, &lt;, etc.), increasing length.
+Token counts vary by model tokenizer. A rough OpenAI-style estimate is ~4 chars/token, so 97 chars ≈ 24 tokens per skill plus your actual field lengths.
+​
+Managed skills lifecycle
+OpenClaw ships a baseline set of skills as bundled skills as part of the install (npm package or OpenClaw.app). ~/.openclaw/skills exists for local overrides (for example, pinning/patching a skill without changing the bundled copy). Workspace skills are user-owned and override both on name conflicts.
+​
+Config reference
+See Skills config for the full configuration schema.
+
+
+Skills
+Skills Config
+All skills-related configuration lives under skills in ~/.openclaw/openclaw.json.
+{
+  skills: {
+    allowBundled: ["gemini", "peekaboo"],
+    load: {
+      extraDirs: ["~/Projects/agent-scripts/skills", "~/Projects/oss/some-skill-pack/skills"],
+      watch: true,
+      watchDebounceMs: 250,
+    },
+    install: {
+      preferBrew: true,
+      nodeManager: "npm", // npm | pnpm | yarn | bun (Gateway runtime still Node; bun not recommended)
+    },
+    entries: {
+      "image-lab": {
+        enabled: true,
+        apiKey: { source: "env", provider: "default", id: "GEMINI_API_KEY" }, // or plaintext string
+        env: {
+          GEMINI_API_KEY: "GEMINI_KEY_HERE",
+        },
+      },
+      peekaboo: { enabled: true },
+      sag: { enabled: false },
+    },
+  },
+}
+For built-in image generation/editing, prefer agents.defaults.imageGenerationModel plus the core image_generate tool. skills.entries.* is only for custom or third-party skill workflows.
+Examples:
+Native Nano Banana-style setup: agents.defaults.imageGenerationModel.primary: "google/gemini-3-pro-image-preview"
+Native fal setup: agents.defaults.imageGenerationModel.primary: "fal/fal-ai/flux/dev"
+​
+Fields
+allowBundled: optional allowlist for bundled skills only. When set, only bundled skills in the list are eligible (managed/workspace skills unaffected).
+load.extraDirs: additional skill directories to scan (lowest precedence).
+load.watch: watch skill folders and refresh the skills snapshot (default: true).
+load.watchDebounceMs: debounce for skill watcher events in milliseconds (default: 250).
+install.preferBrew: prefer brew installers when available (default: true).
+install.nodeManager: node installer preference (npm | pnpm | yarn | bun, default: npm). This only affects skill installs; the Gateway runtime should still be Node (Bun not recommended for WhatsApp/Telegram).
+entries.<skillKey>: per-skill overrides.
+Per-skill fields:
+enabled: set false to disable a skill even if it’s bundled/installed.
+env: environment variables injected for the agent run (only if not already set).
+apiKey: optional convenience for skills that declare a primary env var. Supports plaintext string or SecretRef object ({ source, provider, id }).
+​
+Notes
+Keys under entries map to the skill name by default. If a skill defines metadata.openclaw.skillKey, use that key instead.
+Changes to skills are picked up on the next agent turn when the watcher is enabled.
+​
+Sandboxed skills + env vars
+When a session is sandboxed, skill processes run inside Docker. The sandbox does not inherit the host process.env.
+Use one of:
+agents.defaults.sandbox.docker.env (or per-agent agents.list[].sandbox.docker.env)
+bake the env into your custom sandbox image
+Global env and skills.entries.<skill>.env/apiKey apply to host runs only.
+
+
+Skills
+ClawHub
+ClawHub is the public skill registry for OpenClaw. It is a free service: all skills are public, open, and visible to everyone for sharing and reuse. A skill is just a folder with a SKILL.md file (plus supporting text files). You can browse skills in the web app or use the CLI to search, install, update, and publish skills.
+Site: clawhub.ai
+​
+What ClawHub is
+A public registry for OpenClaw skills.
+A versioned store of skill bundles and metadata.
+A discovery surface for search, tags, and usage signals.
+​
+How it works
+A user publishes a skill bundle (files + metadata).
+ClawHub stores the bundle, parses metadata, and assigns a version.
+The registry indexes the skill for search and discovery.
+Users browse, download, and install skills in OpenClaw.
+​
+What you can do
+Publish new skills and new versions of existing skills.
+Discover skills by name, tags, or search.
+Download skill bundles and inspect their files.
+Report skills that are abusive or unsafe.
+If you are a moderator, hide, unhide, delete, or ban.
+​
+Who this is for (beginner-friendly)
+If you want to add new capabilities to your OpenClaw agent, ClawHub is the easiest way to find and install skills. You do not need to know how the backend works. You can:
+Search for skills by plain language.
+Install a skill into your workspace.
+Update skills later with one command.
+Back up your own skills by publishing them.
+​
+Quick start (non-technical)
+Install the CLI (see next section).
+Search for something you need:
+clawhub search "calendar"
+Install a skill:
+clawhub install <skill-slug>
+Start a new OpenClaw session so it picks up the new skill.
+​
+Install the CLI
+Pick one:
+npm i -g clawhub
+pnpm add -g clawhub
+​
+How it fits into OpenClaw
+By default, the CLI installs skills into ./skills under your current working directory. If an OpenClaw workspace is configured, clawhub falls back to that workspace unless you override --workdir (or CLAWHUB_WORKDIR). OpenClaw loads workspace skills from <workspace>/skills and will pick them up in the next session. If you already use ~/.openclaw/skills or bundled skills, workspace skills take precedence.
+For more detail on how skills are loaded, shared, and gated, see Skills.
+​
+Skill system overview
+A skill is a versioned bundle of files that teaches OpenClaw how to perform a specific task. Each publish creates a new version, and the registry keeps a history of versions so users can audit changes.
+A typical skill includes:
+A SKILL.md file with the primary description and usage.
+Optional configs, scripts, or supporting files used by the skill.
+Metadata such as tags, summary, and install requirements.
+ClawHub uses metadata to power discovery and safely expose skill capabilities. The registry also tracks usage signals (such as stars and downloads) to improve ranking and visibility.
+​
+What the service provides (features)
+Public browsing of skills and their SKILL.md content.
+Search powered by embeddings (vector search), not just keywords.
+Versioning with semver, changelogs, and tags (including latest).
+Downloads as a zip per version.
+Stars and comments for community feedback.
+Moderation hooks for approvals and audits.
+CLI-friendly API for automation and scripting.
+​
+Security and moderation
+ClawHub is open by default. Anyone can upload skills, but a GitHub account must be at least one week old to publish. This helps slow down abuse without blocking legitimate contributors.
+Reporting and moderation:
+Any signed in user can report a skill.
+Report reasons are required and recorded.
+Each user can have up to 20 active reports at a time.
+Skills with more than 3 unique reports are auto hidden by default.
+Moderators can view hidden skills, unhide them, delete them, or ban users.
+Abusing the report feature can result in account bans.
+Interested in becoming a moderator? Ask in the OpenClaw Discord and contact a moderator or maintainer.
+​
+CLI commands and parameters
+Global options (apply to all commands):
+--workdir <dir>: Working directory (default: current dir; falls back to OpenClaw workspace).
+--dir <dir>: Skills directory, relative to workdir (default: skills).
+--site <url>: Site base URL (browser login).
+--registry <url>: Registry API base URL.
+--no-input: Disable prompts (non-interactive).
+-V, --cli-version: Print CLI version.
+Auth:
+clawhub login (browser flow) or clawhub login --token <token>
+clawhub logout
+clawhub whoami
+Options:
+--token <token>: Paste an API token.
+--label <label>: Label stored for browser login tokens (default: CLI token).
+--no-browser: Do not open a browser (requires --token).
+Search:
+clawhub search "query"
+--limit <n>: Max results.
+Install:
+clawhub install <slug>
+--version <version>: Install a specific version.
+--force: Overwrite if the folder already exists.
+Update:
+clawhub update <slug>
+clawhub update --all
+--version <version>: Update to a specific version (single slug only).
+--force: Overwrite when local files do not match any published version.
+List:
+clawhub list (reads .clawhub/lock.json)
+Publish:
+clawhub publish <path>
+--slug <slug>: Skill slug.
+--name <name>: Display name.
+--version <version>: Semver version.
+--changelog <text>: Changelog text (can be empty).
+--tags <tags>: Comma-separated tags (default: latest).
+Delete/undelete (owner/admin only):
+clawhub delete <slug> --yes
+clawhub undelete <slug> --yes
+Sync (scan local skills + publish new/updated):
+clawhub sync
+--root <dir...>: Extra scan roots.
+--all: Upload everything without prompts.
+--dry-run: Show what would be uploaded.
+--bump <type>: patch|minor|major for updates (default: patch).
+--changelog <text>: Changelog for non-interactive updates.
+--tags <tags>: Comma-separated tags (default: latest).
+--concurrency <n>: Registry checks (default: 4).
+​
+Common workflows for agents
+​
+Search for skills
+clawhub search "postgres backups"
+​
+Download new skills
+clawhub install my-skill-pack
+​
+Update installed skills
+clawhub update --all
+​
+Back up your skills (publish or sync)
+For a single skill folder:
+clawhub publish ./my-skill --slug my-skill --name "My Skill" --version 1.0.0 --tags latest
+To scan and back up many skills at once:
+clawhub sync --all
+​
+Advanced details (technical)
+​
+Versioning and tags
+Each publish creates a new semver SkillVersion.
+Tags (like latest) point to a version; moving tags lets you roll back.
+Changelogs are attached per version and can be empty when syncing or publishing updates.
+​
+Local changes vs registry versions
+Updates compare the local skill contents to registry versions using a content hash. If local files do not match any published version, the CLI asks before overwriting (or requires --force in non-interactive runs).
+​
+Sync scanning and fallback roots
+clawhub sync scans your current workdir first. If no skills are found, it falls back to known legacy locations (for example ~/openclaw/skills and ~/.openclaw/skills). This is designed to find older skill installs without extra flags.
+​
+Storage and lockfile
+Installed skills are recorded in .clawhub/lock.json under your workdir.
+Auth tokens are stored in the ClawHub CLI config file (override via CLAWHUB_CONFIG_PATH).
+​
+Telemetry (install counts)
+When you run clawhub sync while logged in, the CLI sends a minimal snapshot to compute install counts. You can disable this entirely:
+export CLAWHUB_DISABLE_TELEMETRY=1
+​
+Environment variables
+CLAWHUB_SITE: Override the site URL.
+CLAWHUB_REGISTRY: Override the registry API URL.
+CLAWHUB_CONFIG_PATH: Override where the CLI stores the token/config.
+CLAWHUB_WORKDIR: Override the default workdir.
+CLAWHUB_DISABLE_TELEMETRY=1: Disable telemetry on sync.
+Skills Config
+
+
+
+Skills
+Plugins
+​
+Quick start
+A plugin is either:
+a native OpenClaw plugin (openclaw.plugin.json + runtime module), or
+a compatible bundle (.codex-plugin/plugin.json or .claude-plugin/plugin.json)
+Both show up under openclaw plugins, but only native OpenClaw plugins execute runtime code in-process.
+See what is already loaded:
+openclaw plugins list
+Install an official plugin (example: Voice Call):
+openclaw plugins install @openclaw/voice-call
+Npm specs are registry-only. See install rules for details on pinning, prerelease gating, and supported spec formats.
+Restart the Gateway, then configure under plugins.entries.<id>.config.
+See Voice Call for a concrete example plugin. Looking for third-party listings? See Community plugins. Need the bundle compatibility details? See Plugin bundles.
+For compatible bundles, install from a local directory or archive:
+openclaw plugins install ./my-bundle
+openclaw plugins install ./my-bundle.tgz
+For Claude marketplace installs, list the marketplace first, then install by marketplace entry name:
+openclaw plugins marketplace list <marketplace-name>
+openclaw plugins install <plugin-name>@<marketplace-name>
+OpenClaw resolves known Claude marketplace names from ~/.claude/plugins/known_marketplaces.json. You can also pass an explicit marketplace source with --marketplace.
+​
+Available plugins (official)
+​
+Installable plugins
+These are published to npm and installed with openclaw plugins install:
+Plugin	Package	Docs
+Matrix	@openclaw/matrix	Matrix
+Microsoft Teams	@openclaw/msteams	MS Teams
+Nostr	@openclaw/nostr	Nostr
+Voice Call	@openclaw/voice-call	Voice Call
+Zalo	@openclaw/zalo	Zalo
+Zalo Personal	@openclaw/zalouser	Zalo Personal
+Microsoft Teams is plugin-only as of 2026.1.15.
+Packaged installs also ship install-on-demand metadata for heavyweight official plugins. Today that includes WhatsApp and memory-lancedb: onboarding, openclaw channels add, openclaw channels login --channel whatsapp, and other channel setup flows prompt to install them when first used instead of shipping their full runtime trees inside the main npm tarball.
+​
+Bundled plugins
+These ship with OpenClaw and are enabled by default unless noted.
+Memory:
+memory-core — bundled memory search (default via plugins.slots.memory)
+memory-lancedb — install-on-demand long-term memory with auto-recall/capture (set plugins.slots.memory = "memory-lancedb")
+Model providers (all enabled by default):
+anthropic, byteplus, cloudflare-ai-gateway, github-copilot, google, huggingface, kilocode, kimi-coding, minimax, mistral, modelstudio, moonshot, nvidia, openai, opencode, opencode-go, openrouter, qianfan, qwen-portal-auth, synthetic, together, venice, vercel-ai-gateway, volcengine, xiaomi, zai
+Speech providers (enabled by default):
+elevenlabs, microsoft
+Other bundled:
+copilot-proxy — VS Code Copilot Proxy bridge (disabled by default)
+​
+Compatible bundles
+OpenClaw also recognizes compatible external bundle layouts:
+Codex-style bundles: .codex-plugin/plugin.json
+Claude-style bundles: .claude-plugin/plugin.json or the default Claude component layout without a manifest
+Cursor-style bundles: .cursor-plugin/plugin.json
+They are shown in the plugin list as format=bundle, with a subtype of codex, claude, or cursor in verbose/inspect output.
+See Plugin bundles for the exact detection rules, mapping behavior, and current support matrix.
+​
+Config
+{
+  plugins: {
+    enabled: true,
+    allow: ["voice-call"],
+    deny: ["untrusted-plugin"],
+    load: { paths: ["~/Projects/oss/voice-call-extension"] },
+    entries: {
+      "voice-call": { enabled: true, config: { provider: "twilio" } },
+    },
+  },
+}
+Fields:
+enabled: master toggle (default: true)
+allow: allowlist (optional)
+deny: denylist (optional; deny wins)
+load.paths: extra plugin files/dirs
+slots: exclusive slot selectors such as memory and contextEngine
+entries.<id>: per-plugin toggles + config
+Config changes require a gateway restart. See Configuration reference for the full config schema.
+Validation rules (strict):
+Unknown plugin ids in entries, allow, deny, or slots are errors.
+Unknown channels.<id> keys are errors unless a plugin manifest declares the channel id.
+Native plugin config is validated using the JSON Schema embedded in openclaw.plugin.json (configSchema).
+Compatible bundles currently do not expose native OpenClaw config schemas.
+If a plugin is disabled, its config is preserved and a warning is emitted.
+​
+Disabled vs missing vs invalid
+These states are intentionally different:
+disabled: plugin exists, but enablement rules turned it off
+missing: config references a plugin id that discovery did not find
+invalid: plugin exists, but its config does not match the declared schema
+OpenClaw preserves config for disabled plugins so toggling them back on is not destructive.
+​
+Discovery and precedence
+OpenClaw scans, in order:
+Config paths
+plugins.load.paths (file or directory)
+Workspace extensions
+<workspace>/.openclaw/extensions/*.ts
+<workspace>/.openclaw/extensions/*/index.ts
+Global extensions
+~/.openclaw/extensions/*.ts
+~/.openclaw/extensions/*/index.ts
+Bundled extensions (shipped with OpenClaw; mixed default-on/default-off)
+<openclaw>/dist/extensions/* in packaged installs
+<workspace>/dist-runtime/extensions/* in local built checkouts
+<workspace>/extensions/* in source/Vitest workflows
+Many bundled provider plugins are enabled by default so model catalogs/runtime hooks stay available without extra setup. Others still require explicit enablement via plugins.entries.<id>.enabled or openclaw plugins enable <id>.
+Bundled plugin runtime dependencies are owned by each plugin package. Packaged builds stage opted-in bundled dependencies under dist/extensions/<id>/node_modules instead of requiring mirrored copies in the root package. Very large official plugins can ship as metadata-only bundled entries and install their runtime package on demand. npm artifacts ship the built dist/extensions/* tree; source extensions/* directories stay in source checkouts only.
+Installed plugins are enabled by default, but can be disabled the same way.
+Workspace plugins are disabled by default unless you explicitly enable them or allowlist them. This is intentional: a checked-out repo should not silently become production gateway code.
+If multiple plugins resolve to the same id, the first match in the order above wins and lower-precedence copies are ignored.
+​
+Enablement rules
+Enablement is resolved after discovery:
+plugins.enabled: false disables all plugins
+plugins.deny always wins
+plugins.entries.<id>.enabled: false disables that plugin
+workspace-origin plugins are disabled by default
+allowlists restrict the active set when plugins.allow is non-empty
+allowlists are id-based, not source-based
+bundled plugins are disabled by default unless:
+the bundled id is in the built-in default-on set, or
+you explicitly enable it, or
+channel config implicitly enables the bundled channel plugin
+exclusive slots can force-enable the selected plugin for that slot
+​
+Plugin slots (exclusive categories)
+Some plugin categories are exclusive (only one active at a time). Use plugins.slots to select which plugin owns the slot:
+{
+  plugins: {
+    slots: {
+      memory: "memory-core", // or "none" to disable memory plugins
+      contextEngine: "legacy", // or a plugin id such as "lossless-claw"
+    },
+  },
+}
+Supported exclusive slots:
+memory: active memory plugin ("none" disables memory plugins)
+contextEngine: active context engine plugin ("legacy" is the built-in default)
+If multiple plugins declare kind: "memory" or kind: "context-engine", only the selected plugin loads for that slot. Others are disabled with diagnostics. Declare kind in your plugin manifest.
+​
+Plugin IDs
+Default plugin ids:
+Package packs: package.json name
+Standalone file: file base name (~/.../voice-call.ts -> voice-call)
+If a plugin exports id, OpenClaw uses it but warns when it does not match the configured id.
+​
+Inspection
+openclaw plugins inspect openai        # deep detail on one plugin
+openclaw plugins inspect openai --json # machine-readable
+openclaw plugins list                  # compact inventory
+openclaw plugins status                # operational summary
+openclaw plugins doctor                # issue-focused diagnostics
+​
+CLI
+openclaw plugins list
+openclaw plugins inspect <id>
+openclaw plugins install <path>                 # copy a local file/dir into ~/.openclaw/extensions/<id>
+openclaw plugins install ./extensions/voice-call # relative path ok
+openclaw plugins install ./plugin.tgz           # install from a local tarball
+openclaw plugins install ./plugin.zip           # install from a local zip
+openclaw plugins install -l ./extensions/voice-call # link (no copy) for dev
+openclaw plugins install @openclaw/voice-call   # install from npm
+openclaw plugins install @openclaw/voice-call --pin # store exact resolved name@version
+openclaw plugins update <id>
+openclaw plugins update --all
+openclaw plugins enable <id>
+openclaw plugins disable <id>
+openclaw plugins doctor
+See openclaw plugins CLI reference for full details on each command (install rules, inspect output, marketplace installs, uninstall).
+Plugins may also register their own top-level commands (example: openclaw voicecall).
+​
+Plugin API (overview)
+Plugins export either:
+A function: (api) => { ... }
+An object: { id, name, configSchema, register(api) { ... } }
+register(api) is where plugins attach behavior. Common registrations include:
+registerTool
+registerHook
+on(...) for typed lifecycle hooks
+registerChannel
+registerProvider
+registerSpeechProvider
+registerMediaUnderstandingProvider
+registerWebSearchProvider
+registerHttpRoute
+registerCommand
+registerCli
+registerContextEngine
+registerService
+See Plugin manifest for the manifest file format.
+​
+Further reading
+Plugin architecture and internals — capability model, ownership model, contracts, load pipeline, runtime helpers, and developer API reference
+Building extensions
+Plugin bundles
+Plugin manifest
+Plugin agent tools
+Capability Cookbook
+Community plugins

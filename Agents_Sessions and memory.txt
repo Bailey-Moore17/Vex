@@ -1,0 +1,1095 @@
+Sessions and memory
+Session Management
+OpenClaw treats one direct-chat session per agent as primary. Direct chats collapse to agent:<agentId>:<mainKey> (default main), while group/channel chats get their own keys. session.mainKey is honored.
+Use session.dmScope to control how direct messages are grouped:
+main (default): all DMs share the main session for continuity.
+per-peer: isolate by sender id across channels.
+per-channel-peer: isolate by channel + sender (recommended for multi-user inboxes).
+per-account-channel-peer: isolate by account + channel + sender (recommended for multi-account inboxes). Use session.identityLinks to map provider-prefixed peer ids to a canonical identity so the same person shares a DM session across channels when using per-peer, per-channel-peer, or per-account-channel-peer.
+​
+Secure DM mode (recommended for multi-user setups)
+Security Warning: If your agent can receive DMs from multiple people, you should strongly consider enabling secure DM mode. Without it, all users share the same conversation context, which can leak private information between users.
+Example of the problem with default settings:
+Alice (<SENDER_A>) messages your agent about a private topic (for example, a medical appointment)
+Bob (<SENDER_B>) messages your agent asking “What were we talking about?”
+Because both DMs share the same session, the model may answer Bob using Alice’s prior context.
+The fix: Set dmScope to isolate sessions per user:
+// ~/.openclaw/openclaw.json
+{
+  session: {
+    // Secure DM mode: isolate DM context per channel + sender.
+    dmScope: "per-channel-peer",
+  },
+}
+When to enable this:
+You have pairing approvals for more than one sender
+You use a DM allowlist with multiple entries
+You set dmPolicy: "open"
+Multiple phone numbers or accounts can message your agent
+Notes:
+Default is dmScope: "main" for continuity (all DMs share the main session). This is fine for single-user setups.
+Local CLI onboarding writes session.dmScope: "per-channel-peer" by default when unset (existing explicit values are preserved).
+For multi-account inboxes on the same channel, prefer per-account-channel-peer.
+If the same person contacts you on multiple channels, use session.identityLinks to collapse their DM sessions into one canonical identity.
+You can verify your DM settings with openclaw security audit (see security).
+​
+Gateway is the source of truth
+All session state is owned by the gateway (the “master” OpenClaw). UI clients (macOS app, WebChat, etc.) must query the gateway for session lists and token counts instead of reading local files.
+In remote mode, the session store you care about lives on the remote gateway host, not your Mac.
+Token counts shown in UIs come from the gateway’s store fields (inputTokens, outputTokens, totalTokens, contextTokens). Clients do not parse JSONL transcripts to “fix up” totals.
+​
+Where state lives
+On the gateway host:
+Store file: ~/.openclaw/agents/<agentId>/sessions/sessions.json (per agent).
+Transcripts: ~/.openclaw/agents/<agentId>/sessions/<SessionId>.jsonl (Telegram topic sessions use .../<SessionId>-topic-<threadId>.jsonl).
+The store is a map sessionKey -> { sessionId, updatedAt, ... }. Deleting entries is safe; they are recreated on demand.
+Group entries may include displayName, channel, subject, room, and space to label sessions in UIs.
+Session entries include origin metadata (label + routing hints) so UIs can explain where a session came from.
+OpenClaw does not read legacy Pi/Tau session folders.
+​
+Maintenance
+OpenClaw applies session-store maintenance to keep sessions.json and transcript artifacts bounded over time.
+​
+Defaults
+session.maintenance.mode: warn
+session.maintenance.pruneAfter: 30d
+session.maintenance.maxEntries: 500
+session.maintenance.rotateBytes: 10mb
+session.maintenance.resetArchiveRetention: defaults to pruneAfter (30d)
+session.maintenance.maxDiskBytes: unset (disabled)
+session.maintenance.highWaterBytes: defaults to 80% of maxDiskBytes when budgeting is enabled
+​
+How it works
+Maintenance runs during session-store writes, and you can trigger it on demand with openclaw sessions cleanup.
+mode: "warn": reports what would be evicted but does not mutate entries/transcripts.
+mode: "enforce": applies cleanup in this order:
+prune stale entries older than pruneAfter
+cap entry count to maxEntries (oldest first)
+archive transcript files for removed entries that are no longer referenced
+purge old *.deleted.<timestamp> and *.reset.<timestamp> archives by retention policy
+rotate sessions.json when it exceeds rotateBytes
+if maxDiskBytes is set, enforce disk budget toward highWaterBytes (oldest artifacts first, then oldest sessions)
+​
+Performance caveat for large stores
+Large session stores are common in high-volume setups. Maintenance work is write-path work, so very large stores can increase write latency.
+What increases cost most:
+very high session.maintenance.maxEntries values
+long pruneAfter windows that keep stale entries around
+many transcript/archive artifacts in ~/.openclaw/agents/<agentId>/sessions/
+enabling disk budgets (maxDiskBytes) without reasonable pruning/cap limits
+What to do:
+use mode: "enforce" in production so growth is bounded automatically
+set both time and count limits (pruneAfter + maxEntries), not just one
+set maxDiskBytes + highWaterBytes for hard upper bounds in large deployments
+keep highWaterBytes meaningfully below maxDiskBytes (default is 80%)
+run openclaw sessions cleanup --dry-run --json after config changes to verify projected impact before enforcing
+for frequent active sessions, pass --active-key when running manual cleanup
+​
+Customize examples
+Use a conservative enforce policy:
+{
+  session: {
+    maintenance: {
+      mode: "enforce",
+      pruneAfter: "45d",
+      maxEntries: 800,
+      rotateBytes: "20mb",
+      resetArchiveRetention: "14d",
+    },
+  },
+}
+Enable a hard disk budget for the sessions directory:
+{
+  session: {
+    maintenance: {
+      mode: "enforce",
+      maxDiskBytes: "1gb",
+      highWaterBytes: "800mb",
+    },
+  },
+}
+Tune for larger installs (example):
+{
+  session: {
+    maintenance: {
+      mode: "enforce",
+      pruneAfter: "14d",
+      maxEntries: 2000,
+      rotateBytes: "25mb",
+      maxDiskBytes: "2gb",
+      highWaterBytes: "1.6gb",
+    },
+  },
+}
+Preview or force maintenance from CLI:
+openclaw sessions cleanup --dry-run
+openclaw sessions cleanup --enforce
+​
+Session pruning
+OpenClaw trims old tool results from the in-memory context right before LLM calls by default. This does not rewrite JSONL history. See /concepts/session-pruning.
+​
+Pre-compaction memory flush
+When a session nears auto-compaction, OpenClaw can run a silent memory flush turn that reminds the model to write durable notes to disk. This only runs when the workspace is writable. See Memory and Compaction.
+​
+Mapping transports → session keys
+Direct chats follow session.dmScope (default main).
+main: agent:<agentId>:<mainKey> (continuity across devices/channels).
+Multiple phone numbers and channels can map to the same agent main key; they act as transports into one conversation.
+per-peer: agent:<agentId>:direct:<peerId>.
+per-channel-peer: agent:<agentId>:<channel>:direct:<peerId>.
+per-account-channel-peer: agent:<agentId>:<channel>:<accountId>:direct:<peerId> (accountId defaults to default).
+If session.identityLinks matches a provider-prefixed peer id (for example telegram:123), the canonical key replaces <peerId> so the same person shares a session across channels.
+Group chats isolate state: agent:<agentId>:<channel>:group:<id> (rooms/channels use agent:<agentId>:<channel>:channel:<id>).
+Telegram forum topics append :topic:<threadId> to the group id for isolation.
+Legacy group:<id> keys are still recognized for migration.
+Inbound contexts may still use group:<id>; the channel is inferred from Provider and normalized to the canonical agent:<agentId>:<channel>:group:<id> form.
+Other sources:
+Cron jobs: cron:<job.id> (isolated) or custom session:<custom-id> (persistent)
+Webhooks: hook:<uuid> (unless explicitly set by the hook)
+Node runs: node-<nodeId>
+​
+Lifecycle
+Reset policy: sessions are reused until they expire, and expiry is evaluated on the next inbound message.
+Daily reset: defaults to 4:00 AM local time on the gateway host. A session is stale once its last update is earlier than the most recent daily reset time.
+Idle reset (optional): idleMinutes adds a sliding idle window. When both daily and idle resets are configured, whichever expires first forces a new session.
+Legacy idle-only: if you set session.idleMinutes without any session.reset/resetByType config, OpenClaw stays in idle-only mode for backward compatibility.
+Per-type overrides (optional): resetByType lets you override the policy for direct, group, and thread sessions (thread = Slack/Discord threads, Telegram topics, Matrix threads when provided by the connector).
+Per-channel overrides (optional): resetByChannel overrides the reset policy for a channel (applies to all session types for that channel and takes precedence over reset/resetByType).
+Reset triggers: exact /new or /reset (plus any extras in resetTriggers) start a fresh session id and pass the remainder of the message through. /new <model> accepts a model alias, provider/model, or provider name (fuzzy match) to set the new session model. If /new or /reset is sent alone, OpenClaw runs a short “hello” greeting turn to confirm the reset.
+Manual reset: delete specific keys from the store or remove the JSONL transcript; the next message recreates them.
+Isolated cron jobs always mint a fresh sessionId per run (no idle reuse).
+​
+Send policy (optional)
+Block delivery for specific session types without listing individual ids.
+{
+  session: {
+    sendPolicy: {
+      rules: [
+        { action: "deny", match: { channel: "discord", chatType: "group" } },
+        { action: "deny", match: { keyPrefix: "cron:" } },
+        // Match the raw session key (including the `agent:<id>:` prefix).
+        { action: "deny", match: { rawKeyPrefix: "agent:main:discord:" } },
+      ],
+      default: "allow",
+    },
+  },
+}
+Runtime override (owner only):
+/send on → allow for this session
+/send off → deny for this session
+/send inherit → clear override and use config rules Send these as standalone messages so they register.
+​
+Configuration (optional rename example)
+// ~/.openclaw/openclaw.json
+{
+  session: {
+    scope: "per-sender", // keep group keys separate
+    dmScope: "main", // DM continuity (set per-channel-peer/per-account-channel-peer for shared inboxes)
+    identityLinks: {
+      alice: ["telegram:123456789", "discord:987654321012345678"],
+    },
+    reset: {
+      // Defaults: mode=daily, atHour=4 (gateway host local time).
+      // If you also set idleMinutes, whichever expires first wins.
+      mode: "daily",
+      atHour: 4,
+      idleMinutes: 120,
+    },
+    resetByType: {
+      thread: { mode: "daily", atHour: 4 },
+      direct: { mode: "idle", idleMinutes: 240 },
+      group: { mode: "idle", idleMinutes: 120 },
+    },
+    resetByChannel: {
+      discord: { mode: "idle", idleMinutes: 10080 },
+    },
+    resetTriggers: ["/new", "/reset"],
+    store: "~/.openclaw/agents/{agentId}/sessions/sessions.json",
+    mainKey: "main",
+  },
+}
+​
+Inspecting
+openclaw status — shows store path and recent sessions.
+openclaw sessions --json — dumps every entry (filter with --active <minutes>).
+openclaw gateway call sessions.list --params '{}' — fetch sessions from the running gateway (use --url/--token for remote gateway access).
+Send /status as a standalone message in chat to see whether the agent is reachable, how much of the session context is used, current thinking/fast/verbose toggles, and when your WhatsApp web creds were last refreshed (helps spot relink needs).
+Send /context list or /context detail to see what’s in the system prompt and injected workspace files (and the biggest context contributors).
+Send /stop (or standalone abort phrases like stop, stop action, stop run, stop openclaw) to abort the current run, clear queued followups for that session, and stop any sub-agent runs spawned from it (the reply includes the stopped count).
+Send /compact (optional instructions) as a standalone message to summarize older context and free up window space. See /concepts/compaction.
+JSONL transcripts can be opened directly to review full turns.
+​
+Tips
+Keep the primary key dedicated to 1:1 traffic; let groups keep their own keys.
+When automating cleanup, delete individual keys instead of the whole store to preserve context elsewhere.
+​
+Session origin metadata
+Each session entry records where it came from (best-effort) in origin:
+label: human label (resolved from conversation label + group subject/channel)
+provider: normalized channel id (including extensions)
+from/to: raw routing ids from the inbound envelope
+accountId: provider account id (when multi-account)
+threadId: thread/topic id when the channel supports it The origin fields are populated for direct messages, channels, and groups. If a connector only updates delivery routing (for example, to keep a DM main session fresh), it should still provide inbound context so the session keeps its explainer metadata. Extensions can do this by sending ConversationLabel, GroupSubject, GroupChannel, GroupSpace, and SenderName in the inbound context and calling recordSessionMetaFromInbound (or passing the same context to updateLastRoute).
+
+
+
+Sessions and memory
+Session Pruning
+Session pruning trims old tool results from the in-memory context right before each LLM call. It does not rewrite the on-disk session history (*.jsonl).
+​
+When it runs
+When mode: "cache-ttl" is enabled and the last Anthropic call for the session is older than ttl.
+Only affects the messages sent to the model for that request.
+Only active for Anthropic API calls (and OpenRouter Anthropic models).
+For best results, match ttl to your model cacheRetention policy (short = 5m, long = 1h).
+After a prune, the TTL window resets so subsequent requests keep cache until ttl expires again.
+​
+Smart defaults (Anthropic)
+OAuth or setup-token profiles: enable cache-ttl pruning and set heartbeat to 1h.
+API key profiles: enable cache-ttl pruning, set heartbeat to 30m, and default cacheRetention: "short" on Anthropic models.
+If you set any of these values explicitly, OpenClaw does not override them.
+​
+What this improves (cost + cache behavior)
+Why prune: Anthropic prompt caching only applies within the TTL. If a session goes idle past the TTL, the next request re-caches the full prompt unless you trim it first.
+What gets cheaper: pruning reduces the cacheWrite size for that first request after the TTL expires.
+Why the TTL reset matters: once pruning runs, the cache window resets, so follow‑up requests can reuse the freshly cached prompt instead of re-caching the full history again.
+What it does not do: pruning doesn’t add tokens or “double” costs; it only changes what gets cached on that first post‑TTL request.
+​
+What can be pruned
+Only toolResult messages.
+User + assistant messages are never modified.
+The last keepLastAssistants assistant messages are protected; tool results after that cutoff are not pruned.
+If there aren’t enough assistant messages to establish the cutoff, pruning is skipped.
+Tool results containing image blocks are skipped (never trimmed/cleared).
+​
+Context window estimation
+Pruning uses an estimated context window (chars ≈ tokens × 4). The base window is resolved in this order:
+models.providers.*.models[].contextWindow override.
+Model definition contextWindow (from the model registry).
+Default 200000 tokens.
+If agents.defaults.contextTokens is set, it is treated as a cap (min) on the resolved window.
+​
+Mode
+​
+cache-ttl
+Pruning only runs if the last Anthropic call is older than ttl (default 5m).
+When it runs: same soft-trim + hard-clear behavior as before.
+​
+Soft vs hard pruning
+Soft-trim: only for oversized tool results.
+Keeps head + tail, inserts ..., and appends a note with the original size.
+Skips results with image blocks.
+Hard-clear: replaces the entire tool result with hardClear.placeholder.
+​
+Tool selection
+tools.allow / tools.deny support * wildcards.
+Deny wins.
+Matching is case-insensitive.
+Empty allow list => all tools allowed.
+​
+Interaction with other limits
+Built-in tools already truncate their own output; session pruning is an extra layer that prevents long-running chats from accumulating too much tool output in the model context.
+Compaction is separate: compaction summarizes and persists, pruning is transient per request. See /concepts/compaction.
+​
+Defaults (when enabled)
+ttl: "5m"
+keepLastAssistants: 3
+softTrimRatio: 0.3
+hardClearRatio: 0.5
+minPrunableToolChars: 50000
+softTrim: { maxChars: 4000, headChars: 1500, tailChars: 1500 }
+hardClear: { enabled: true, placeholder: "[Old tool result content cleared]" }
+​
+Examples
+Default (off):
+{
+  agents: { defaults: { contextPruning: { mode: "off" } } },
+}
+Enable TTL-aware pruning:
+{
+  agents: { defaults: { contextPruning: { mode: "cache-ttl", ttl: "5m" } } },
+}
+Restrict pruning to specific tools:
+{
+  agents: {
+    defaults: {
+      contextPruning: {
+        mode: "cache-ttl",
+        tools: { allow: ["exec", "read"], deny: ["*image*"] },
+      },
+    },
+  },
+}
+See config reference: Gateway Configuration
+
+
+
+
+Sessions and memory
+Session Tools
+Goal: small, hard-to-misuse tool set so agents can list sessions, fetch history, and send to another session.
+​
+Tool Names
+sessions_list
+sessions_history
+sessions_send
+sessions_spawn
+​
+Key Model
+Main direct chat bucket is always the literal key "main" (resolved to the current agent’s main key).
+Group chats use agent:<agentId>:<channel>:group:<id> or agent:<agentId>:<channel>:channel:<id> (pass the full key).
+Cron jobs use cron:<job.id>.
+Hooks use hook:<uuid> unless explicitly set.
+Node sessions use node-<nodeId> unless explicitly set.
+global and unknown are reserved values and are never listed. If session.scope = "global", we alias it to main for all tools so callers never see global.
+​
+sessions_list
+List sessions as an array of rows.
+Parameters:
+kinds?: string[] filter: any of "main" | "group" | "cron" | "hook" | "node" | "other"
+limit?: number max rows (default: server default, clamp e.g. 200)
+activeMinutes?: number only sessions updated within N minutes
+messageLimit?: number 0 = no messages (default 0); >0 = include last N messages
+Behavior:
+messageLimit > 0 fetches chat.history per session and includes the last N messages.
+Tool results are filtered out in list output; use sessions_history for tool messages.
+When running in a sandboxed agent session, session tools default to spawned-only visibility (see below).
+Row shape (JSON):
+key: session key (string)
+kind: main | group | cron | hook | node | other
+channel: whatsapp | telegram | discord | signal | imessage | webchat | internal | unknown
+displayName (group display label if available)
+updatedAt (ms)
+sessionId
+model, contextTokens, totalTokens
+thinkingLevel, verboseLevel, systemSent, abortedLastRun
+sendPolicy (session override if set)
+lastChannel, lastTo
+deliveryContext (normalized { channel, to, accountId } when available)
+transcriptPath (best-effort path derived from store dir + sessionId)
+messages? (only when messageLimit > 0)
+​
+sessions_history
+Fetch transcript for one session.
+Parameters:
+sessionKey (required; accepts session key or sessionId from sessions_list)
+limit?: number max messages (server clamps)
+includeTools?: boolean (default false)
+Behavior:
+includeTools=false filters role: "toolResult" messages.
+Returns messages array in the raw transcript format.
+When given a sessionId, OpenClaw resolves it to the corresponding session key (missing ids error).
+​
+Gateway session history and live transcript APIs
+Control UI and gateway clients can use the lower level history and live transcript surfaces directly.
+HTTP:
+GET /sessions/{sessionKey}/history
+Query params: limit, cursor, includeTools=1, follow=1
+Unknown sessions return HTTP 404 with error.type = "not_found"
+follow=1 upgrades the response to an SSE stream of transcript updates for that session
+WebSocket:
+sessions.subscribe subscribes to all session lifecycle and transcript events visible to the client
+sessions.messages.subscribe { key } subscribes only to session.message events for one session
+sessions.messages.unsubscribe { key } removes that targeted transcript subscription
+session.message carries appended transcript messages plus live usage metadata when available
+sessions.changed emits phase: "message" for transcript appends so session lists can refresh counters and previews
+​
+sessions_send
+Send a message into another session.
+Parameters:
+sessionKey (required; accepts session key or sessionId from sessions_list)
+message (required)
+timeoutSeconds?: number (default >0; 0 = fire-and-forget)
+Behavior:
+timeoutSeconds = 0: enqueue and return { runId, status: "accepted" }.
+timeoutSeconds > 0: wait up to N seconds for completion, then return { runId, status: "ok", reply }.
+If wait times out: { runId, status: "timeout", error }. Run continues; call sessions_history later.
+If the run fails: { runId, status: "error", error }.
+Announce delivery runs after the primary run completes and is best-effort; status: "ok" does not guarantee the announce was delivered.
+Waits via gateway agent.wait (server-side) so reconnects don’t drop the wait.
+Agent-to-agent message context is injected for the primary run.
+Inter-session messages are persisted with message.provenance.kind = "inter_session" so transcript readers can distinguish routed agent instructions from external user input.
+After the primary run completes, OpenClaw runs a reply-back loop:
+Round 2+ alternates between requester and target agents.
+Reply exactly REPLY_SKIP to stop the ping‑pong.
+Max turns is session.agentToAgent.maxPingPongTurns (0–5, default 5).
+Once the loop ends, OpenClaw runs the agent‑to‑agent announce step (target agent only):
+Reply exactly ANNOUNCE_SKIP to stay silent.
+Any other reply is sent to the target channel.
+Announce step includes the original request + round‑1 reply + latest ping‑pong reply.
+​
+Channel Field
+For groups, channel is the channel recorded on the session entry.
+For direct chats, channel maps from lastChannel.
+For cron/hook/node, channel is internal.
+If missing, channel is unknown.
+​
+Security / Send Policy
+Policy-based blocking by channel/chat type (not per session id).
+{
+  "session": {
+    "sendPolicy": {
+      "rules": [
+        {
+          "match": { "channel": "discord", "chatType": "group" },
+          "action": "deny"
+        }
+      ],
+      "default": "allow"
+    }
+  }
+}
+Runtime override (per session entry):
+sendPolicy: "allow" | "deny" (unset = inherit config)
+Settable via sessions.patch or owner-only /send on|off|inherit (standalone message).
+Enforcement points:
+chat.send / agent (gateway)
+auto-reply delivery logic
+​
+sessions_spawn
+Spawn a sub-agent run in an isolated session and announce the result back to the requester chat channel.
+Parameters:
+task (required)
+label? (optional; used for logs/UI)
+agentId? (optional; spawn under another agent id if allowed)
+model? (optional; overrides the sub-agent model; invalid values error)
+thinking? (optional; overrides thinking level for the sub-agent run)
+runTimeoutSeconds? (defaults to agents.defaults.subagents.runTimeoutSeconds when set, otherwise 0; when set, aborts the sub-agent run after N seconds)
+thread? (default false; request thread-bound routing for this spawn when supported by the channel/plugin)
+mode? (run|session; defaults to run, but defaults to session when thread=true; mode="session" requires thread=true)
+cleanup? (delete|keep, default keep)
+sandbox? (inherit|require, default inherit; require rejects spawn unless the target child runtime is sandboxed)
+attachments? (optional array of inline files; subagent runtime only, ACP rejects). Each entry: { name, content, encoding?: "utf8" | "base64", mimeType? }. Files are materialized into the child workspace at .openclaw/attachments/<uuid>/. Returns a receipt with sha256 per file.
+attachAs? (optional; { mountPath? } hint reserved for future mount implementations)
+Allowlist:
+agents.list[].subagents.allowAgents: list of agent ids allowed via agentId (["*"] to allow any). Default: only the requester agent.
+Sandbox inheritance guard: if the requester session is sandboxed, sessions_spawn rejects targets that would run unsandboxed.
+Discovery:
+Use agents_list to discover which agent ids are allowed for sessions_spawn.
+Behavior:
+Starts a new agent:<agentId>:subagent:<uuid> session with deliver: false.
+Sub-agents default to the full tool set minus session tools (configurable via tools.subagents.tools).
+Sub-agents are not allowed to call sessions_spawn (no sub-agent → sub-agent spawning).
+Always non-blocking: returns { status: "accepted", runId, childSessionKey } immediately.
+With thread=true, channel plugins can bind delivery/routing to a thread target (Discord support is controlled by session.threadBindings.* and channels.discord.threadBindings.*).
+After completion, OpenClaw runs a sub-agent announce step and posts the result to the requester chat channel.
+If the assistant final reply is empty, the latest toolResult from sub-agent history is included as Result.
+Reply exactly ANNOUNCE_SKIP during the announce step to stay silent.
+Announce replies are normalized to Status/Result/Notes; Status comes from runtime outcome (not model text).
+Sub-agent sessions are auto-archived after agents.defaults.subagents.archiveAfterMinutes (default: 60).
+Announce replies include a stats line (runtime, tokens, sessionKey/sessionId, transcript path, and optional cost).
+​
+Sandbox Session Visibility
+Session tools can be scoped to reduce cross-session access.
+Default behavior:
+tools.sessions.visibility defaults to tree (current session + spawned subagent sessions).
+For sandboxed sessions, agents.defaults.sandbox.sessionToolsVisibility can hard-clamp visibility.
+Config:
+{
+  tools: {
+    sessions: {
+      // "self" | "tree" | "agent" | "all"
+      // default: "tree"
+      visibility: "tree",
+    },
+  },
+  agents: {
+    defaults: {
+      sandbox: {
+        // default: "spawned"
+        sessionToolsVisibility: "spawned", // or "all"
+      },
+    },
+  },
+}
+Notes:
+self: only the current session key.
+tree: current session + sessions spawned by the current session.
+agent: any session belonging to the current agent id.
+all: any session (cross-agent access still requires tools.agentToAgent).
+When a session is sandboxed and sessionToolsVisibility="spawned", OpenClaw clamps visibility to tree even if you set tools.sessions.visibility="all".
+
+
+
+Sessions and memory
+Memory
+OpenClaw memory is plain Markdown in the agent workspace. The files are the source of truth; the model only “remembers” what gets written to disk.
+Memory search tools are provided by the active memory plugin (default: memory-core). Disable memory plugins with plugins.slots.memory = "none".
+​
+Memory files (Markdown)
+The default workspace layout uses two memory layers:
+memory/YYYY-MM-DD.md
+Daily log (append-only).
+Read today + yesterday at session start.
+MEMORY.md (optional)
+Curated long-term memory.
+If both MEMORY.md and memory.md exist at the workspace root, OpenClaw only loads MEMORY.md.
+Lowercase memory.md is only used as a fallback when MEMORY.md is absent.
+Only load in the main, private session (never in group contexts).
+These files live under the workspace (agents.defaults.workspace, default ~/.openclaw/workspace). See Agent workspace for the full layout.
+​
+Memory tools
+OpenClaw exposes two agent-facing tools for these Markdown files:
+memory_search — semantic recall over indexed snippets.
+memory_get — targeted read of a specific Markdown file/line range.
+memory_get now degrades gracefully when a file doesn’t exist (for example, today’s daily log before the first write). Both the builtin manager and the QMD backend return { text: "", path } instead of throwing ENOENT, so agents can handle “nothing recorded yet” and continue their workflow without wrapping the tool call in try/catch logic.
+​
+When to write memory
+Decisions, preferences, and durable facts go to MEMORY.md.
+Day-to-day notes and running context go to memory/YYYY-MM-DD.md.
+If someone says “remember this,” write it down (do not keep it in RAM).
+This area is still evolving. It helps to remind the model to store memories; it will know what to do.
+If you want something to stick, ask the bot to write it into memory.
+​
+Automatic memory flush (pre-compaction ping)
+When a session is close to auto-compaction, OpenClaw triggers a silent, agentic turn that reminds the model to write durable memory before the context is compacted. The default prompts explicitly say the model may reply, but usually NO_REPLY is the correct response so the user never sees this turn.
+This is controlled by agents.defaults.compaction.memoryFlush:
+{
+  agents: {
+    defaults: {
+      compaction: {
+        reserveTokensFloor: 20000,
+        memoryFlush: {
+          enabled: true,
+          softThresholdTokens: 4000,
+          systemPrompt: "Session nearing compaction. Store durable memories now.",
+          prompt: "Write any lasting notes to memory/YYYY-MM-DD.md; reply with NO_REPLY if nothing to store.",
+        },
+      },
+    },
+  },
+}
+Details:
+Soft threshold: flush triggers when the session token estimate crosses contextWindow - reserveTokensFloor - softThresholdTokens.
+Silent by default: prompts include NO_REPLY so nothing is delivered.
+Two prompts: a user prompt plus a system prompt append the reminder.
+One flush per compaction cycle (tracked in sessions.json).
+Workspace must be writable: if the session runs sandboxed with workspaceAccess: "ro" or "none", the flush is skipped.
+For the full compaction lifecycle, see Session management + compaction.
+​
+Vector memory search
+OpenClaw can build a small vector index over MEMORY.md and memory/*.md so semantic queries can find related notes even when wording differs.
+Defaults:
+Enabled by default.
+Watches memory files for changes (debounced).
+Configure memory search under agents.defaults.memorySearch (not top-level memorySearch).
+Uses remote embeddings by default. If memorySearch.provider is not set, OpenClaw auto-selects:
+local if a memorySearch.local.modelPath is configured and the file exists.
+openai if an OpenAI key can be resolved.
+gemini if a Gemini key can be resolved.
+voyage if a Voyage key can be resolved.
+mistral if a Mistral key can be resolved.
+Otherwise memory search stays disabled until configured.
+Local mode uses node-llama-cpp and may require pnpm approve-builds.
+Uses sqlite-vec (when available) to accelerate vector search inside SQLite.
+memorySearch.provider = "ollama" is also supported for local/self-hosted Ollama embeddings (/api/embeddings), but it is not auto-selected.
+Remote embeddings require an API key for the embedding provider. OpenClaw resolves keys from auth profiles, models.providers.*.apiKey, or environment variables. Codex OAuth only covers chat/completions and does not satisfy embeddings for memory search. For Gemini, use GEMINI_API_KEY or models.providers.google.apiKey. For Voyage, use VOYAGE_API_KEY or models.providers.voyage.apiKey. For Mistral, use MISTRAL_API_KEY or models.providers.mistral.apiKey. Ollama typically does not require a real API key (a placeholder like OLLAMA_API_KEY=ollama-local is enough when needed by local policy). When using a custom OpenAI-compatible endpoint, set memorySearch.remote.apiKey (and optional memorySearch.remote.headers).
+​
+QMD backend (experimental)
+Set memory.backend = "qmd" to swap the built-in SQLite indexer for QMD: a local-first search sidecar that combines BM25 + vectors + reranking. Markdown stays the source of truth; OpenClaw shells out to QMD for retrieval. Key points:
+Prereqs
+Disabled by default. Opt in per-config (memory.backend = "qmd").
+Install the QMD CLI separately (bun install -g https://github.com/tobi/qmd or grab a release) and make sure the qmd binary is on the gateway’s PATH.
+QMD needs an SQLite build that allows extensions (brew install sqlite on macOS).
+QMD runs fully locally via Bun + node-llama-cpp and auto-downloads GGUF models from HuggingFace on first use (no separate Ollama daemon required).
+The gateway runs QMD in a self-contained XDG home under ~/.openclaw/agents/<agentId>/qmd/ by setting XDG_CONFIG_HOME and XDG_CACHE_HOME.
+OS support: macOS and Linux work out of the box once Bun + SQLite are installed. Windows is best supported via WSL2.
+How the sidecar runs
+The gateway writes a self-contained QMD home under ~/.openclaw/agents/<agentId>/qmd/ (config + cache + sqlite DB).
+Collections are created via qmd collection add from memory.qmd.paths (plus default workspace memory files), then qmd update + qmd embed run on boot and on a configurable interval (memory.qmd.update.interval, default 5 m).
+The gateway now initializes the QMD manager on startup, so periodic update timers are armed even before the first memory_search call.
+Boot refresh now runs in the background by default so chat startup is not blocked; set memory.qmd.update.waitForBootSync = true to keep the previous blocking behavior.
+Searches run via memory.qmd.searchMode (default qmd search --json; also supports vsearch and query). If the selected mode rejects flags on your QMD build, OpenClaw retries with qmd query. If QMD fails or the binary is missing, OpenClaw automatically falls back to the builtin SQLite manager so memory tools keep working.
+OpenClaw does not expose QMD embed batch-size tuning today; batch behavior is controlled by QMD itself.
+First search may be slow: QMD may download local GGUF models (reranker/query expansion) on the first qmd query run.
+OpenClaw sets XDG_CONFIG_HOME/XDG_CACHE_HOME automatically when it runs QMD.
+If you want to pre-download models manually (and warm the same index OpenClaw uses), run a one-off query with the agent’s XDG dirs.
+OpenClaw’s QMD state lives under your state dir (defaults to ~/.openclaw). You can point qmd at the exact same index by exporting the same XDG vars OpenClaw uses:
+# Pick the same state dir OpenClaw uses
+STATE_DIR="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+
+export XDG_CONFIG_HOME="$STATE_DIR/agents/main/qmd/xdg-config"
+export XDG_CACHE_HOME="$STATE_DIR/agents/main/qmd/xdg-cache"
+
+# (Optional) force an index refresh + embeddings
+qmd update
+qmd embed
+
+# Warm up / trigger first-time model downloads
+qmd query "test" -c memory-root --json >/dev/null 2>&1
+Config surface (memory.qmd.*)
+command (default qmd): override the executable path.
+searchMode (default search): pick which QMD command backs memory_search (search, vsearch, query).
+includeDefaultMemory (default true): auto-index MEMORY.md + memory/**/*.md.
+paths[]: add extra directories/files (path, optional pattern, optional stable name).
+sessions: opt into session JSONL indexing (enabled, retentionDays, exportDir).
+update: controls refresh cadence and maintenance execution: (interval, debounceMs, onBoot, waitForBootSync, embedInterval, commandTimeoutMs, updateTimeoutMs, embedTimeoutMs).
+limits: clamp recall payload (maxResults, maxSnippetChars, maxInjectedChars, timeoutMs).
+scope: same schema as session.sendPolicy. Default is DM-only (deny all, allow direct chats); loosen it to surface QMD hits in groups/channels.
+match.keyPrefix matches the normalized session key (lowercased, with any leading agent:<id>: stripped). Example: discord:channel:.
+match.rawKeyPrefix matches the raw session key (lowercased), including agent:<id>:. Example: agent:main:discord:.
+Legacy: match.keyPrefix: "agent:..." is still treated as a raw-key prefix, but prefer rawKeyPrefix for clarity.
+When scope denies a search, OpenClaw logs a warning with the derived channel/chatType so empty results are easier to debug.
+Snippets sourced outside the workspace show up as qmd/<collection>/<relative-path> in memory_search results; memory_get understands that prefix and reads from the configured QMD collection root.
+When memory.qmd.sessions.enabled = true, OpenClaw exports sanitized session transcripts (User/Assistant turns) into a dedicated QMD collection under ~/.openclaw/agents/<id>/qmd/sessions/, so memory_search can recall recent conversations without touching the builtin SQLite index.
+memory_search snippets now include a Source: <path#line> footer when memory.citations is auto/on; set memory.citations = "off" to keep the path metadata internal (the agent still receives the path for memory_get, but the snippet text omits the footer and the system prompt warns the agent not to cite it).
+Example
+memory: {
+  backend: "qmd",
+  citations: "auto",
+  qmd: {
+    includeDefaultMemory: true,
+    update: { interval: "5m", debounceMs: 15000 },
+    limits: { maxResults: 6, timeoutMs: 4000 },
+    scope: {
+      default: "deny",
+      rules: [
+        { action: "allow", match: { chatType: "direct" } },
+        // Normalized session-key prefix (strips `agent:<id>:`).
+        { action: "deny", match: { keyPrefix: "discord:channel:" } },
+        // Raw session-key prefix (includes `agent:<id>:`).
+        { action: "deny", match: { rawKeyPrefix: "agent:main:discord:" } },
+      ]
+    },
+    paths: [
+      { name: "docs", path: "~/notes", pattern: "**/*.md" }
+    ]
+  }
+}
+Citations & fallback
+memory.citations applies regardless of backend (auto/on/off).
+When qmd runs, we tag status().backend = "qmd" so diagnostics show which engine served the results. If the QMD subprocess exits or JSON output can’t be parsed, the search manager logs a warning and returns the builtin provider (existing Markdown embeddings) until QMD recovers.
+​
+Additional memory paths
+If you want to index Markdown files outside the default workspace layout, add explicit paths:
+agents: {
+  defaults: {
+    memorySearch: {
+      extraPaths: ["../team-docs", "/srv/shared-notes/overview.md"]
+    }
+  }
+}
+Notes:
+Paths can be absolute or workspace-relative.
+Directories are scanned recursively for .md files.
+By default, only Markdown files are indexed.
+If memorySearch.multimodal.enabled = true, OpenClaw also indexes supported image/audio files under extraPaths only. Default memory roots (MEMORY.md, memory.md, memory/**/*.md) stay Markdown-only.
+Symlinks are ignored (files or directories).
+​
+Multimodal memory files (Gemini image + audio)
+OpenClaw can index image and audio files from memorySearch.extraPaths when using Gemini embedding 2:
+agents: {
+  defaults: {
+    memorySearch: {
+      provider: "gemini",
+      model: "gemini-embedding-2-preview",
+      extraPaths: ["assets/reference", "voice-notes"],
+      multimodal: {
+        enabled: true,
+        modalities: ["image", "audio"], // or ["all"]
+        maxFileBytes: 10000000
+      },
+      remote: {
+        apiKey: "YOUR_GEMINI_API_KEY"
+      }
+    }
+  }
+}
+Notes:
+Multimodal memory is currently supported only for gemini-embedding-2-preview.
+Multimodal indexing applies only to files discovered through memorySearch.extraPaths.
+Supported modalities in this phase: image and audio.
+memorySearch.fallback must stay "none" while multimodal memory is enabled.
+Matching image/audio file bytes are uploaded to the configured Gemini embedding endpoint during indexing.
+Supported image extensions: .jpg, .jpeg, .png, .webp, .gif, .heic, .heif.
+Supported audio extensions: .mp3, .wav, .ogg, .opus, .m4a, .aac, .flac.
+Search queries remain text, but Gemini can compare those text queries against indexed image/audio embeddings.
+memory_get still reads Markdown only; binary files are searchable but not returned as raw file contents.
+​
+Gemini embeddings (native)
+Set the provider to gemini to use the Gemini embeddings API directly:
+agents: {
+  defaults: {
+    memorySearch: {
+      provider: "gemini",
+      model: "gemini-embedding-001",
+      remote: {
+        apiKey: "YOUR_GEMINI_API_KEY"
+      }
+    }
+  }
+}
+Notes:
+remote.baseUrl is optional (defaults to the Gemini API base URL).
+remote.headers lets you add extra headers if needed.
+Default model: gemini-embedding-001.
+gemini-embedding-2-preview is also supported: 8192 token limit and configurable dimensions (768 / 1536 / 3072, default 3072).
+​
+Gemini Embedding 2 (preview)
+agents: {
+  defaults: {
+    memorySearch: {
+      provider: "gemini",
+      model: "gemini-embedding-2-preview",
+      outputDimensionality: 3072,  // optional: 768, 1536, or 3072 (default)
+      remote: {
+        apiKey: "YOUR_GEMINI_API_KEY"
+      }
+    }
+  }
+}
+⚠️ Re-index required: Switching from gemini-embedding-001 (768 dimensions) to gemini-embedding-2-preview (3072 dimensions) changes the vector size. The same is true if you change outputDimensionality between 768, 1536, and 3072. OpenClaw will automatically reindex when it detects a model or dimension change.
+If you want to use a custom OpenAI-compatible endpoint (OpenRouter, vLLM, or a proxy), you can use the remote configuration with the OpenAI provider:
+agents: {
+  defaults: {
+    memorySearch: {
+      provider: "openai",
+      model: "text-embedding-3-small",
+      remote: {
+        baseUrl: "https://api.example.com/v1/",
+        apiKey: "YOUR_OPENAI_COMPAT_API_KEY",
+        headers: { "X-Custom-Header": "value" }
+      }
+    }
+  }
+}
+If you don’t want to set an API key, use memorySearch.provider = "local" or set memorySearch.fallback = "none".
+Fallbacks:
+memorySearch.fallback can be openai, gemini, voyage, mistral, ollama, local, or none.
+The fallback provider is only used when the primary embedding provider fails.
+Batch indexing (OpenAI + Gemini + Voyage):
+Disabled by default. Set agents.defaults.memorySearch.remote.batch.enabled = true to enable for large-corpus indexing (OpenAI, Gemini, and Voyage).
+Default behavior waits for batch completion; tune remote.batch.wait, remote.batch.pollIntervalMs, and remote.batch.timeoutMinutes if needed.
+Set remote.batch.concurrency to control how many batch jobs we submit in parallel (default: 2).
+Batch mode applies when memorySearch.provider = "openai" or "gemini" and uses the corresponding API key.
+Gemini batch jobs use the async embeddings batch endpoint and require Gemini Batch API availability.
+Why OpenAI batch is fast + cheap:
+For large backfills, OpenAI is typically the fastest option we support because we can submit many embedding requests in a single batch job and let OpenAI process them asynchronously.
+OpenAI offers discounted pricing for Batch API workloads, so large indexing runs are usually cheaper than sending the same requests synchronously.
+See the OpenAI Batch API docs and pricing for details:
+https://platform.openai.com/docs/api-reference/batch
+https://platform.openai.com/pricing
+Config example:
+agents: {
+  defaults: {
+    memorySearch: {
+      provider: "openai",
+      model: "text-embedding-3-small",
+      fallback: "openai",
+      remote: {
+        batch: { enabled: true, concurrency: 2 }
+      },
+      sync: { watch: true }
+    }
+  }
+}
+Tools:
+memory_search — returns snippets with file + line ranges.
+memory_get — read memory file content by path.
+Local mode:
+Set agents.defaults.memorySearch.provider = "local".
+Provide agents.defaults.memorySearch.local.modelPath (GGUF or hf: URI).
+Optional: set agents.defaults.memorySearch.fallback = "none" to avoid remote fallback.
+​
+How the memory tools work
+memory_search semantically searches Markdown chunks (~400 token target, 80-token overlap) from MEMORY.md + memory/**/*.md. It returns snippet text (capped ~700 chars), file path, line range, score, provider/model, and whether we fell back from local → remote embeddings. No full file payload is returned.
+memory_get reads a specific memory Markdown file (workspace-relative), optionally from a starting line and for N lines. Paths outside MEMORY.md / memory/ are rejected.
+Both tools are enabled only when memorySearch.enabled resolves true for the agent.
+​
+What gets indexed (and when)
+File type: Markdown only (MEMORY.md, memory/**/*.md).
+Index storage: per-agent SQLite at ~/.openclaw/memory/<agentId>.sqlite (configurable via agents.defaults.memorySearch.store.path, supports {agentId} token).
+Freshness: watcher on MEMORY.md + memory/ marks the index dirty (debounce 1.5s). Sync is scheduled on session start, on search, or on an interval and runs asynchronously. Session transcripts use delta thresholds to trigger background sync.
+Reindex triggers: the index stores the embedding provider/model + endpoint fingerprint + chunking params. If any of those change, OpenClaw automatically resets and reindexes the entire store.
+​
+Hybrid search (BM25 + vector)
+When enabled, OpenClaw combines:
+Vector similarity (semantic match, wording can differ)
+BM25 keyword relevance (exact tokens like IDs, env vars, code symbols)
+If full-text search is unavailable on your platform, OpenClaw falls back to vector-only search.
+​
+Why hybrid?
+Vector search is great at “this means the same thing”:
+“Mac Studio gateway host” vs “the machine running the gateway”
+“debounce file updates” vs “avoid indexing on every write”
+But it can be weak at exact, high-signal tokens:
+IDs (a828e60, b3b9895a…)
+code symbols (memorySearch.query.hybrid)
+error strings (“sqlite-vec unavailable”)
+BM25 (full-text) is the opposite: strong at exact tokens, weaker at paraphrases. Hybrid search is the pragmatic middle ground: use both retrieval signals so you get good results for both “natural language” queries and “needle in a haystack” queries.
+​
+How we merge results (the current design)
+Implementation sketch:
+Retrieve a candidate pool from both sides:
+Vector: top maxResults * candidateMultiplier by cosine similarity.
+BM25: top maxResults * candidateMultiplier by FTS5 BM25 rank (lower is better).
+Convert BM25 rank into a 0..1-ish score:
+textScore = 1 / (1 + max(0, bm25Rank))
+Union candidates by chunk id and compute a weighted score:
+finalScore = vectorWeight * vectorScore + textWeight * textScore
+Notes:
+vectorWeight + textWeight is normalized to 1.0 in config resolution, so weights behave as percentages.
+If embeddings are unavailable (or the provider returns a zero-vector), we still run BM25 and return keyword matches.
+If FTS5 can’t be created, we keep vector-only search (no hard failure).
+This isn’t “IR-theory perfect”, but it’s simple, fast, and tends to improve recall/precision on real notes. If we want to get fancier later, common next steps are Reciprocal Rank Fusion (RRF) or score normalization (min/max or z-score) before mixing.
+​
+Post-processing pipeline
+After merging vector and keyword scores, two optional post-processing stages refine the result list before it reaches the agent:
+Vector + Keyword → Weighted Merge → Temporal Decay → Sort → MMR → Top-K Results
+Both stages are off by default and can be enabled independently.
+​
+MMR re-ranking (diversity)
+When hybrid search returns results, multiple chunks may contain similar or overlapping content. For example, searching for “home network setup” might return five nearly identical snippets from different daily notes that all mention the same router configuration.
+MMR (Maximal Marginal Relevance) re-ranks the results to balance relevance with diversity, ensuring the top results cover different aspects of the query instead of repeating the same information.
+How it works:
+Results are scored by their original relevance (vector + BM25 weighted score).
+MMR iteratively selects results that maximize: λ × relevance − (1−λ) × max_similarity_to_selected.
+Similarity between results is measured using Jaccard text similarity on tokenized content.
+The lambda parameter controls the trade-off:
+lambda = 1.0 → pure relevance (no diversity penalty)
+lambda = 0.0 → maximum diversity (ignores relevance)
+Default: 0.7 (balanced, slight relevance bias)
+Example — query: “home network setup”
+Given these memory files:
+memory/2026-02-10.md  → "Configured Omada router, set VLAN 10 for IoT devices"
+memory/2026-02-08.md  → "Configured Omada router, moved IoT to VLAN 10"
+memory/2026-02-05.md  → "Set up AdGuard DNS on 192.168.10.2"
+memory/network.md     → "Router: Omada ER605, AdGuard: 192.168.10.2, VLAN 10: IoT"
+Without MMR — top 3 results:
+1. memory/2026-02-10.md  (score: 0.92)  ← router + VLAN
+2. memory/2026-02-08.md  (score: 0.89)  ← router + VLAN (near-duplicate!)
+3. memory/network.md     (score: 0.85)  ← reference doc
+With MMR (λ=0.7) — top 3 results:
+1. memory/2026-02-10.md  (score: 0.92)  ← router + VLAN
+2. memory/network.md     (score: 0.85)  ← reference doc (diverse!)
+3. memory/2026-02-05.md  (score: 0.78)  ← AdGuard DNS (diverse!)
+The near-duplicate from Feb 8 drops out, and the agent gets three distinct pieces of information.
+When to enable: If you notice memory_search returning redundant or near-duplicate snippets, especially with daily notes that often repeat similar information across days.
+​
+Temporal decay (recency boost)
+Agents with daily notes accumulate hundreds of dated files over time. Without decay, a well-worded note from six months ago can outrank yesterday’s update on the same topic.
+Temporal decay applies an exponential multiplier to scores based on the age of each result, so recent memories naturally rank higher while old ones fade:
+decayedScore = score × e^(-λ × ageInDays)
+where λ = ln(2) / halfLifeDays.
+With the default half-life of 30 days:
+Today’s notes: 100% of original score
+7 days ago: ~84%
+30 days ago: 50%
+90 days ago: 12.5%
+180 days ago: ~1.6%
+Evergreen files are never decayed:
+MEMORY.md (root memory file)
+Non-dated files in memory/ (e.g., memory/projects.md, memory/network.md)
+These contain durable reference information that should always rank normally.
+Dated daily files (memory/YYYY-MM-DD.md) use the date extracted from the filename. Other sources (e.g., session transcripts) fall back to file modification time (mtime).
+Example — query: “what’s Rod’s work schedule?”
+Given these memory files (today is Feb 10):
+memory/2025-09-15.md  → "Rod works Mon-Fri, standup at 10am, pairing at 2pm"  (148 days old)
+memory/2026-02-10.md  → "Rod has standup at 14:15, 1:1 with Zeb at 14:45"    (today)
+memory/2026-02-03.md  → "Rod started new team, standup moved to 14:15"        (7 days old)
+Without decay:
+1. memory/2025-09-15.md  (score: 0.91)  ← best semantic match, but stale!
+2. memory/2026-02-10.md  (score: 0.82)
+3. memory/2026-02-03.md  (score: 0.80)
+With decay (halfLife=30):
+1. memory/2026-02-10.md  (score: 0.82 × 1.00 = 0.82)  ← today, no decay
+2. memory/2026-02-03.md  (score: 0.80 × 0.85 = 0.68)  ← 7 days, mild decay
+3. memory/2025-09-15.md  (score: 0.91 × 0.03 = 0.03)  ← 148 days, nearly gone
+The stale September note drops to the bottom despite having the best raw semantic match.
+When to enable: If your agent has months of daily notes and you find that old, stale information outranks recent context. A half-life of 30 days works well for daily-note-heavy workflows; increase it (e.g., 90 days) if you reference older notes frequently.
+​
+Configuration
+Both features are configured under memorySearch.query.hybrid:
+agents: {
+  defaults: {
+    memorySearch: {
+      query: {
+        hybrid: {
+          enabled: true,
+          vectorWeight: 0.7,
+          textWeight: 0.3,
+          candidateMultiplier: 4,
+          // Diversity: reduce redundant results
+          mmr: {
+            enabled: true,    // default: false
+            lambda: 0.7       // 0 = max diversity, 1 = max relevance
+          },
+          // Recency: boost newer memories
+          temporalDecay: {
+            enabled: true,    // default: false
+            halfLifeDays: 30  // score halves every 30 days
+          }
+        }
+      }
+    }
+  }
+}
+You can enable either feature independently:
+MMR only — useful when you have many similar notes but age doesn’t matter.
+Temporal decay only — useful when recency matters but your results are already diverse.
+Both — recommended for agents with large, long-running daily note histories.
+​
+Embedding cache
+OpenClaw can cache chunk embeddings in SQLite so reindexing and frequent updates (especially session transcripts) don’t re-embed unchanged text.
+Config:
+agents: {
+  defaults: {
+    memorySearch: {
+      cache: {
+        enabled: true,
+        maxEntries: 50000
+      }
+    }
+  }
+}
+​
+Session memory search (experimental)
+You can optionally index session transcripts and surface them via memory_search. This is gated behind an experimental flag.
+agents: {
+  defaults: {
+    memorySearch: {
+      experimental: { sessionMemory: true },
+      sources: ["memory", "sessions"]
+    }
+  }
+}
+Notes:
+Session indexing is opt-in (off by default).
+Session updates are debounced and indexed asynchronously once they cross delta thresholds (best-effort).
+memory_search never blocks on indexing; results can be slightly stale until background sync finishes.
+Results still include snippets only; memory_get remains limited to memory files.
+Session indexing is isolated per agent (only that agent’s session logs are indexed).
+Session logs live on disk (~/.openclaw/agents/<agentId>/sessions/*.jsonl). Any process/user with filesystem access can read them, so treat disk access as the trust boundary. For stricter isolation, run agents under separate OS users or hosts.
+Delta thresholds (defaults shown):
+agents: {
+  defaults: {
+    memorySearch: {
+      sync: {
+        sessions: {
+          deltaBytes: 100000,   // ~100 KB
+          deltaMessages: 50     // JSONL lines
+        }
+      }
+    }
+  }
+}
+​
+SQLite vector acceleration (sqlite-vec)
+When the sqlite-vec extension is available, OpenClaw stores embeddings in a SQLite virtual table (vec0) and performs vector distance queries in the database. This keeps search fast without loading every embedding into JS.
+Configuration (optional):
+agents: {
+  defaults: {
+    memorySearch: {
+      store: {
+        vector: {
+          enabled: true,
+          extensionPath: "/path/to/sqlite-vec"
+        }
+      }
+    }
+  }
+}
+Notes:
+enabled defaults to true; when disabled, search falls back to in-process cosine similarity over stored embeddings.
+If the sqlite-vec extension is missing or fails to load, OpenClaw logs the error and continues with the JS fallback (no vector table).
+extensionPath overrides the bundled sqlite-vec path (useful for custom builds or non-standard install locations).
+​
+Local embedding auto-download
+Default local embedding model: hf:ggml-org/embeddinggemma-300m-qat-q8_0-GGUF/embeddinggemma-300m-qat-Q8_0.gguf (~0.6 GB).
+When memorySearch.provider = "local", node-llama-cpp resolves modelPath; if the GGUF is missing it auto-downloads to the cache (or local.modelCacheDir if set), then loads it. Downloads resume on retry.
+Native build requirement: run pnpm approve-builds, pick node-llama-cpp, then pnpm rebuild node-llama-cpp.
+Fallback: if local setup fails and memorySearch.fallback = "openai", we automatically switch to remote embeddings (openai/text-embedding-3-small unless overridden) and record the reason.
+​
+Custom OpenAI-compatible endpoint example
+agents: {
+  defaults: {
+    memorySearch: {
+      provider: "openai",
+      model: "text-embedding-3-small",
+      remote: {
+        baseUrl: "https://api.example.com/v1/",
+        apiKey: "YOUR_REMOTE_API_KEY",
+        headers: {
+          "X-Organization": "org-id",
+          "X-Project": "project-id"
+        }
+      }
+    }
+  }
+}
+Notes:
+remote.* takes precedence over models.providers.openai.*.
+remote.headers merge with OpenAI headers; remote wins on key conflicts. Omit remote.headers to use the OpenAI defaults.
+
+
+
+
+Sessions and memory
+Compaction
+Every model has a context window (max tokens it can see). Long-running chats accumulate messages and tool results; once the window is tight, OpenClaw compacts older history to stay within limits.
+​
+What compaction is
+Compaction summarizes older conversation into a compact summary entry and keeps recent messages intact. The summary is stored in the session history, so future requests use:
+The compaction summary
+Recent messages after the compaction point
+Compaction persists in the session’s JSONL history.
+​
+Configuration
+Use the agents.defaults.compaction setting in your openclaw.json to configure compaction behavior (mode, target tokens, etc.). Compaction summarization preserves opaque identifiers by default (identifierPolicy: "strict"). You can override this with identifierPolicy: "off" or provide custom text with identifierPolicy: "custom" and identifierInstructions.
+You can optionally specify a different model for compaction summarization via agents.defaults.compaction.model. This is useful when your primary model is a local or small model and you want compaction summaries produced by a more capable model. The override accepts any provider/model-id string:
+{
+  "agents": {
+    "defaults": {
+      "compaction": {
+        "model": "openrouter/anthropic/claude-sonnet-4-5"
+      }
+    }
+  }
+}
+This also works with local models, for example a second Ollama model dedicated to summarization or a fine-tuned compaction specialist:
+{
+  "agents": {
+    "defaults": {
+      "compaction": {
+        "model": "ollama/llama3.1:8b"
+      }
+    }
+  }
+}
+When unset, compaction uses the agent’s primary model.
+​
+Auto-compaction (default on)
+When a session nears or exceeds the model’s context window, OpenClaw triggers auto-compaction and may retry the original request using the compacted context.
+You’ll see:
+🧹 Auto-compaction complete in verbose mode
+/status showing 🧹 Compactions: <count>
+Before compaction, OpenClaw can run a silent memory flush turn to store durable notes to disk. See Memory for details and config.
+​
+Manual compaction
+Use /compact (optionally with instructions) to force a compaction pass:
+/compact Focus on decisions and open questions
+​
+Context window source
+Context window is model-specific. OpenClaw uses the model definition from the configured provider catalog to determine limits.
+​
+Compaction vs pruning
+Compaction: summarises and persists in JSONL.
+Session pruning: trims old tool results only, in-memory, per request.
+See /concepts/session-pruning for pruning details.
+​
+OpenAI server-side compaction
+OpenClaw also supports OpenAI Responses server-side compaction hints for compatible direct OpenAI models. This is separate from local OpenClaw compaction and can run alongside it.
+Local compaction: OpenClaw summarizes and persists into session JSONL.
+Server-side compaction: OpenAI compacts context on the provider side when store + context_management are enabled.
+See OpenAI provider for model params and overrides.
+​
+Custom context engines
+Compaction behavior is owned by the active context engine. The legacy engine uses the built-in summarization described above. Plugin engines (selected via plugins.slots.contextEngine) can implement any compaction strategy — DAG summaries, vector retrieval, incremental condensation, etc.
+When a plugin engine sets ownsCompaction: true, OpenClaw delegates all compaction decisions to the engine and does not run built-in auto-compaction.
+When ownsCompaction is false or unset, OpenClaw may still use Pi’s built-in in-attempt auto-compaction, but the active engine’s compact() method still handles /compact and overflow recovery. There is no automatic fallback to the legacy engine’s compaction path.
+If you are building a non-owning context engine, implement compact() by calling delegateCompactionToRuntime(...) from openclaw/plugin-sdk/core.
+​
+Tips
+Use /compact when sessions feel stale or context is bloated.
+Large tool outputs are already truncated; pruning can further reduce tool-result buildup.
+If you need a fresh slate, /new or /reset starts a new session id.
