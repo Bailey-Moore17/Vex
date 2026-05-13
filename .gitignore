@@ -1,0 +1,34 @@
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Local notes / drafts (the public design docs live at the repo root)
+drafts/
+scratch/
+*.draft.md
+
+# Local environment
+.env
+.env.*
+!.env.example
+
+# Dependencies (if implementation lands here later)
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Logs
+*.log
+logs/
+
+# Agent runtime state (kept private)
+state/
+sessions/
+workspace/
+memory/
